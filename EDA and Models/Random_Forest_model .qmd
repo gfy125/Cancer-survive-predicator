@@ -1,0 +1,150 @@
+---
+title: "Random Forest Survival Prediction"
+format: html
+editor: visual
+---
+
+# Load Libraries and Data
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(randomForest)
+library(survival)
+library(pROC)
+library(dplyr)
+library(caret)
+library(ggplot2)
+```
+
+# Preparing
+
+```{r}
+# Load SKCM expression object
+load("SKCM.rda")
+
+# Extract clinical data
+clinical <- colData(query2) %>%
+  as.data.frame() %>%
+  select(patient, gender, vital_status, days_to_death, 
+         ajcc_pathologic_stage, age_at_diagnosis) %>%
+  mutate(
+    survival_time = days_to_death / 365,
+    event = ifelse(vital_status == "Dead", 1, 0),
+    age_diagnosis = age_at_diagnosis / 365
+  ) %>%
+  filter(!is.na(survival_time) & !is.na(event))
+
+# Log2 transform expression data
+log_expr <- log2(assay(query2, "fpkm_uq_unstrand") + 1)
+
+# Match samples between clinical and expression
+matched_samples <- intersect(rownames(clinical), colnames(log_expr))
+clinical <- clinical[matched_samples, ]
+log_expr <- log_expr[, matched_samples]
+```
+
+# Feature Selection
+
+```{r}
+select_top_var_genes <- function(expr, n = 1000) {
+  top_genes <- names(sort(apply(expr, 1, var), decreasing = TRUE))[1:n]
+  return(top_genes)
+}
+
+select_surv_genes <- function(expr, time, event, n = 50) {
+  pvals <- sapply(1:nrow(expr), function(i) {
+    fit <- tryCatch(coxph(Surv(time, event) ~ expr[i,]), error = function(e) NULL)
+    if (!is.null(fit)) summary(fit)$coefficients[1, 5] else 1
+  })
+  names(pvals) <- rownames(expr)
+  top_genes <- names(sort(pvals))[1:n]
+  return(top_genes)
+}
+
+top_genes <- select_top_var_genes(log_expr, 1000)
+log_expr_sub <- log_expr[top_genes, ]
+surv_genes <- select_surv_genes(log_expr_sub, clinical$survival_time, clinical$event, 50)
+expr_final <- t(log_expr[surv_genes, ])
+
+rf_data <- as.data.frame(expr_final) %>%
+  mutate(
+    survival_time = clinical$survival_time,
+    event = clinical$event,
+    gender = factor(clinical$gender),
+    age_diagnosis = clinical$age_diagnosis,
+    stage = factor(case_when(
+      grepl("I", clinical$ajcc_pathologic_stage) ~ "Early",
+      grepl("II", clinical$ajcc_pathologic_stage) ~ "Intermediate",
+      grepl("III|IV", clinical$ajcc_pathologic_stage) ~ "Advanced",
+      TRUE ~ NA_character_
+    ))
+  )
+```
+
+# Remove NA
+
+```{r}
+nzv <- nearZeroVar(rf_data %>% select(-survival_time, -event), names = TRUE)
+rf_data <- rf_data[, setdiff(colnames(rf_data), nzv)]
+rf_data <- na.omit(rf_data)
+```
+
+# Split data
+
+```{r}
+set.seed(42)
+idx_event <- which(rf_data$event == 1)
+idx_censored <- which(rf_data$event == 0)
+
+train_idx <- c(
+  sample(idx_event, size = round(0.7 * length(idx_event))),
+  sample(idx_censored, size = round(0.7 * length(idx_censored)))
+)
+test_idx <- setdiff(seq_len(nrow(rf_data)), train_idx)
+
+train_data <- rf_data[train_idx, ]
+test_data <- rf_data[test_idx, ]
+```
+
+# Train Random Forest
+
+```{r}
+rf_model <- randomForest(survival_time ~ ., data = train_data %>% select(-event), ntree = 100, importance = TRUE)
+test_data$predicted <- predict(rf_model, newdata = test_data)
+```
+
+# Evaluate Model
+
+```{r}
+c_index <- concordance(Surv(test_data$survival_time, test_data$event) ~ test_data$predicted)$concordance
+
+test_data$surv_1yr <- with(test_data, ifelse(survival_time <= 1 & event == 1, 1, 0))
+valid <- with(test_data, survival_time >= 1 | (survival_time < 1 & event == 1))
+labels <- test_data$surv_1yr[valid]
+scores <- test_data$predicted[valid]
+valid_idx <- complete.cases(labels, scores)
+
+roc_plot <- if (sum(valid_idx) > 10) {
+  roc_obj <- roc(labels[valid_idx], scores[valid_idx], direction = "<")
+  auc_val <- as.numeric(auc(roc_obj))
+  ggroc(roc_obj) + geom_abline(linetype = "dashed") +
+    labs(title = "1-Year Mortality ROC (RF)", subtitle = paste("AUC =", round(auc_val, 3))) +
+    theme_minimal()
+} else {
+  ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Not enough samples for ROC") + theme_void()
+}
+```
+
+# Output Table and Plot
+
+```{r}
+metrics <- data.frame(
+  Metric = c("C-index", "AUC (1yr)"),
+  Value = c(round(c_index, 3), if (exists("auc_val")) round(auc_val, 3) else NA)
+)
+knitr::kable(metrics, caption = "Random Forest Model Performance")
+
+print(roc_plot)
+```
+

@@ -1,0 +1,230 @@
+---
+title: "Cox"
+format: html
+editor: visual
+---
+
+# Loading
+```{r setup}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(pROC)
+library(tidyr)
+
+load("SKCM.rda")
+```
+
+
+# Data preparing
+```{r}
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(bcr_patient_barcode, gender, vital_status, days_to_death, age_at_diagnosis, ajcc_pathologic_stage) %>%
+  mutate(
+    survival_time = ifelse(!is.na(days_to_death), days_to_death / 365, age_at_diagnosis / 365),
+    event = ifelse(vital_status == "Dead", 1, 0),
+    age_diagnosis = age_at_diagnosis / 365,
+    ajcc_pathologic_stage =
+      ifelse(is.na(ajcc_pathologic_stage), "Unknown",
+             ajcc_pathologic_stage)
+  ) %>%
+  # Remove patients without valid survival time
+  filter(!is.na(survival_time) & survival_time > 0)
+
+log_expr <- log2(assay(query2, "fpkm_uq_unstrand") + 1)
+
+matched_samples <- intersect(rownames(clinical), colnames(log_expr))
+clinical <- clinical[matched_samples, ]
+log_expr <- log_expr[, matched_samples]
+```
+
+
+# Feature selection
+```{r}
+# Select top 1000 most variable genes
+select_top_var_genes <- function(expr, n = 1000) {
+  top_genes <- names(sort(apply(expr, 1, var), decreasing = TRUE))[1:n]
+  return(top_genes)
+}
+
+# Select top 50 genes associated with survival using Cox p-values
+select_surv_genes <- function(expr, time, event, n = 50) {
+  pvals <- sapply(1:nrow(expr), function(i) {
+    fit <- tryCatch(coxph(Surv(time, event) ~ expr[i,]), error = function(e) NULL)
+    if (!is.null(fit)) summary(fit)$coefficients[1, 5] else 1
+  })
+  names(pvals) <- rownames(expr)
+  top_genes <- names(sort(pvals))[1:n]
+  return(top_genes)
+}
+
+top1k <- select_top_var_genes(log_expr, 1000)
+sub_expr <- log_expr[top1k, ]
+
+surv50 <- select_surv_genes(sub_expr,
+                            clinical$survival_time,
+                            clinical$event, n=50)
+
+expr_final <- t(log_expr[surv50, ])
+
+surv_data <- clinical %>%
+  select(survival_time, event,
+         age_diagnosis, gender, ajcc_pathologic_stage) %>%
+  bind_cols(as.data.frame(expr_final)) %>%
+  mutate(
+    gender = factor(gender),
+    ajcc_pathologic_stage = factor(ajcc_pathologic_stage)
+  )
+```
+
+
+# Train/Test Split
+```{r}
+set.seed(42)
+idx_evt    <- which(surv_data$event == 1)
+idx_cens   <- which(surv_data$event == 0)
+train_idx  <- c(
+  sample(idx_evt,  round(0.7 * length(idx_evt))),
+  sample(idx_cens, round(0.7 * length(idx_cens)))
+)
+test_idx   <- setdiff(seq_len(nrow(surv_data)), train_idx)
+
+train_data <- surv_data[train_idx, ]
+test_data  <- surv_data[test_idx, ]
+```
+
+
+# Cox model
+```{r}
+calculate_cindex <- function(pred, time, status) {
+  concordance(Surv(time, status) ~ pred)$concordance
+}
+
+
+build_cox_model <- function(train_data, test_data) {
+  predictors <- setdiff(names(train_data),
+                        c("survival_time","event"))
+  form <- as.formula(
+    paste("Surv(survival_time, event) ~",
+          paste(predictors, collapse = " + "))
+  )
+  
+  cox_model <- coxph(form, data = train_data)
+  
+  # risk score
+  lp <- predict(cox_model, newdata = test_data, type = "lp")
+  test_data$risk_score <- as.numeric(lp)
+  
+  # 1-year mortality indicator
+  test_data <- test_data %>%
+    mutate(
+      surv_1yr = ifelse(survival_time <= 1 & event==1, 1, 0),
+      valid   = survival_time >= 1 |
+                (survival_time < 1 & event==1)
+    )
+  
+  # ROC & AUC
+  auc_val <- NA
+  if (sum(test_data$valid) > 10) {
+    roc_obj <- roc(test_data$surv_1yr[test_data$valid],
+                   test_data$risk_score[test_data$valid])
+    auc_val <- as.numeric(auc(roc_obj))
+  }
+  
+  list(
+    model     = cox_model,
+    test_data = test_data,
+    cindex    = calculate_cindex(lp,
+                                 test_data$survival_time,
+                                 test_data$event),
+    auc       = auc_val
+  )
+}
+
+# Run Cox model
+cox_res <- build_cox_model(train_data, test_data)
+```
+
+
+# Visualization
+```{r}
+# Risk score density
+ggplot(cox_res$test_data, aes(x=risk_score, fill=factor(event))) +
+  geom_density(alpha=0.6) + theme_minimal() +
+  labs(title="Risk Score Distribution",
+       x="Risk Score", fill="Event")
+
+# ROC curve
+if (!is.na(cox_res$auc)) {
+  roc_obj <- roc(cox_res$test_data$surv_1yr[cox_res$test_data$valid],
+                 cox_res$test_data$risk_score[cox_res$test_data$valid])
+  ggroc(roc_obj) +
+    geom_abline(linetype="dashed") +
+    theme_minimal() +
+    labs(title="ROC for 1-Year Mortality",
+         subtitle=paste("AUC =", round(cox_res$auc,3)))
+} else {
+  ggplot() + annotate("text",0.5,0.5,"Not enough samples for ROC") +
+    theme_void()
+}
+
+# KM curve
+cox_res$test_data$risk_group <- factor(
+  ifelse(cox_res$test_data$risk_score > 
+         median(cox_res$test_data$risk_score, na.rm=TRUE),
+         "High","Low"),
+  levels = c("Low","High")
+)
+
+km_data <- cox_res$test_data %>%
+  filter(
+    !is.na(survival_time),
+    !is.na(event),
+    !is.na(risk_group)
+  )
+
+km_fit <- survfit(Surv(survival_time, event) ~ risk_group, data = km_data)
+ggsurvplot(km_fit, data = km_data, pval = TRUE, risk.table = TRUE, title = "KM Curve by Risk Group")
+
+# Variable importance
+coefs <- summary(cox_res$model)$coefficients
+varimp <- data.frame(
+  var = rownames(coefs),
+  importance = abs(coefs[,"coef"])
+) %>% arrange(desc(importance))
+ggplot(varimp[1:20,], aes(x=reorder(var,importance),
+                          y=importance)) +
+  geom_col() + coord_flip() + theme_minimal() +
+  labs(title="Top 20 Variables by |Coefficient|",
+       x="Variable", y="|Coefficient|")
+```
+
+
+# Metrics Table
+```{r}
+calib_fit <- coxph(
+  Surv(survival_time, event) ~ offset(risk_score) + I(risk_score),
+  data = cox_res$test_data
+)
+cal_slope <- coef(calib_fit)["I(risk_score)"]
+
+
+metrics <- data.frame(
+  Metric = c(
+    "C-index",
+    "AUC (1-Year Mortality)",
+    "Calibration Slope"
+  ),
+  Value = c(
+    round(cox_res$cindex, 3),
+    round(cox_res$auc,    3),
+    round(cal_slope,      3)
+  )
+)
+
+knitr::kable(metrics, caption = "Cox Model Evaluation Metrics")
+```

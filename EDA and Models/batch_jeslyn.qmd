@@ -1,0 +1,198 @@
+---
+title: "Batch Correction"
+format:
+  html:
+    code-tools: true
+    code-fold: true
+    fig_caption: yes
+    number_sections: yes
+    embed-resources: true
+    theme: flatly
+    css: 
+      - https://use.fontawesome.com/releases/v5.0.6/css/all.css
+    toc: true
+    toc_depth: 4
+    toc_float: true
+execute:
+  echo: true
+  tidy: true
+---
+
+# Loading Libraries and Data
+
+```{r warning=FALSE, message=FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(limma)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(sva)
+library(reshape2)
+
+data <- load("SKCM.rda")
+
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+
+log_expr <- log2(fpkm + 1)
+```
+
+
+
+```{r}
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) {
+  if (length(x) >= 6) return(x[6]) else return(NA)
+})
+
+
+gene_var <- apply(log_expr, 1, var)
+log_expr_filtered <- log_expr[gene_var > 0, ]
+```
+
+# Distribution Before Batch Correction
+
+```{r}
+# Add batch info
+expr_long_before <- melt(log_expr_filtered)
+colnames(expr_long_before) <- c("Gene", "Sample", "Expression")
+
+# Map batch information to each sample
+expr_long_before$Batch <- batch[match(expr_long_before$Sample, colnames(log_expr_filtered))]
+
+ggplot(expr_long_before, aes(x = Batch, y = Expression, fill = Batch)) +
+  geom_boxplot(outlier.color = "red", alpha = 0.6) +
+  theme_minimal() +
+  labs(
+    title = "Expression Distribution by Batch (Before Batch Correction)",
+    x = "Batch",
+    y = "log2(FPKM + 1)"
+  )
+
+```
+
+
+# PCA Before Batch Correction
+
+```{r}
+pca_raw <- prcomp(t(log_expr_filtered), scale. = TRUE)
+pca_df_raw <- data.frame(
+  PC1 = pca_raw$x[, 1],
+  PC2 = pca_raw$x[, 2],
+  PC3 = pca_raw$x[, 3],
+  PC4 = pca_raw$x[, 4],
+  batch = batch
+)
+```
+
+::: {.panel-tabset}
+
+## PC1 vs PC2
+
+```{r}
+ggplot(pca_df_raw, aes(x = PC1, y = PC2, color = batch)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA Before Batch Correction", x = "PC1", y = "PC2")
+
+```
+
+## PC2 vs PC3
+
+```{r}
+ggplot(pca_df_raw, aes(x = PC2, y = PC3, color = batch)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA Before Batch Correction", x = "PC2", y = "PC3")
+
+```
+
+## PC3 vs PC4
+
+```{r}
+ggplot(pca_df_raw, aes(x = PC3, y = PC4, color = batch)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA Before Batch Correction", x = "PC3", y = "PC4")
+
+```
+
+:::
+
+# PCA After Batch Correction
+
+```{r}
+# ComBat 
+modcombat <- model.matrix(~1, data = data.frame(batch = batch))
+combat_expr <- ComBat(dat = as.matrix(log_expr_filtered),
+                      batch = batch,
+                      mod = modcombat,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+```
+
+```{r}
+# PCA
+pca_corrected <- prcomp(t(combat_expr), scale. = TRUE)
+pca_df_corrected <- data.frame(
+  PC1 = pca_corrected$x[, 1],
+  PC2 = pca_corrected$x[, 2],
+  PC3 = pca_corrected$x[, 3],
+  PC4 = pca_corrected$x[, 4],
+  batch = batch
+)
+```
+
+::: {.panel-tabset}
+
+## PC1 vs PC2
+
+```{r}
+ggplot(pca_df_corrected, aes(x = PC1, y = PC2, color = batch)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA After Batch Correction", x = "PC1", y = "PC2")
+```
+
+## PC2 vs PC3
+
+```{r}
+ggplot(pca_df_corrected, aes(x = PC2, y = PC3, color = batch)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA After Batch Correction", x = "PC2", y = "PC3")
+```
+
+## PC3 vs PC4
+
+```{r}
+ggplot(pca_df_corrected, aes(x = PC3, y = PC4, color = batch)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA After Batch Correction", x = "PC3", y = "PC4")
+```
+
+:::
+
+# Distribution After Batch Correction
+
+```{r}
+expr_long_after <- melt(combat_expr)
+colnames(expr_long_after) <- c("Gene", "Sample", "Expression")
+
+# Map batch info the same way
+expr_long_after$Batch <- batch[match(expr_long_after$Sample, colnames(combat_expr))]
+
+ggplot(expr_long_after, aes(x = Batch, y = Expression, fill = Batch)) +
+  geom_boxplot(outlier.color = "red", alpha = 0.6) +
+  theme_minimal() +
+  labs(
+    title = "Expression Distribution by Batch (After Batch Correction)",
+    x = "Batch",
+    y = "log2(FPKM + 1)"
+  )
+
+```
+
+

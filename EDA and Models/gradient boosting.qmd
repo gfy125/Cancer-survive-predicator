@@ -1,0 +1,207 @@
+---
+title: "GBM"
+format: html
+editor: visual
+---
+
+# Load Libraries and Data
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(limma)
+library(survival)
+library(survminer)
+library(gbm)
+library(pROC)
+library(ggplot2)
+library(caret)
+library(tidyverse)
+library(viridis)
+library(pdp)
+
+
+# Load the SKCM data
+data <- load("SKCM.rda")
+```
+
+# Data Preparation
+```{r}
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  select(patient, gender, vital_status, days_to_death, 
+         ajcc_pathologic_stage, age_at_diagnosis) %>%
+  mutate(
+    survival_time = days_to_death / 365,
+    event = ifelse(vital_status == "Dead", 1, 0),
+    age_diagnosis = age_at_diagnosis / 365
+  ) %>%
+  filter(!is.na(survival_time) & !is.na(event))
+
+log_expr <- log2(assay(query2, "fpkm_uq_unstrand") + 1)
+
+matched_samples <- intersect(rownames(clinical), colnames(log_expr))
+clinical <- clinical[matched_samples, ]
+log_expr <- log_expr[, matched_samples]
+```
+
+# Feature Selection
+```{r}
+select_top_var_genes <- function(expr, n = 1000) {
+  top_genes <- names(sort(apply(expr, 1, var), decreasing = TRUE))[1:n]
+  return(top_genes)
+}
+
+select_surv_genes <- function(expr, time, event, n = 50) {
+  pvals <- sapply(1:nrow(expr), function(i) {
+    fit <- tryCatch(coxph(Surv(time, event) ~ expr[i,]), error=function(e) NULL)
+    if (!is.null(fit)) summary(fit)$coefficients[1, 5] else 1
+  })
+  names(pvals) <- rownames(expr)
+  top_genes <- names(sort(pvals))[1:n]
+  return(top_genes)
+}
+
+top_genes <- select_top_var_genes(log_expr, 1000)
+log_expr_sub <- log_expr[top_genes, ]
+surv_genes <- select_surv_genes(log_expr_sub, clinical$survival_time, clinical$event, 50)
+expr_final <- t(log_expr[surv_genes, ])
+
+surv_data <- as.data.frame(expr_final) %>%
+  mutate(
+    survival_time = clinical$survival_time,
+    event = clinical$event,
+    gender = factor(clinical$gender),
+    age_diagnosis = clinical$age_diagnosis,
+    stage = factor(case_when(
+      grepl("I", clinical$ajcc_pathologic_stage) ~ "Early",
+      grepl("II", clinical$ajcc_pathologic_stage) ~ "Intermediate",
+      grepl("III|IV", clinical$ajcc_pathologic_stage) ~ "Advanced",
+      TRUE ~ NA_character_
+    ))
+  )
+
+```
+
+# Remove Zero-Variance Predictors (keep outcome columns)
+```{r}
+nzv <- nearZeroVar(surv_data %>% select(-survival_time, -event), names = TRUE)
+surv_data <- surv_data[, setdiff(colnames(surv_data), nzv)]
+```
+
+# Train/Test Split
+```{r}
+set.seed(42)
+idx_event <- which(surv_data$event == 1)
+idx_censored <- which(surv_data$event == 0)
+
+train_idx <- c(
+  sample(idx_event, size = round(0.7 * length(idx_event))),
+  sample(idx_censored, size = round(0.7 * length(idx_censored)))
+)
+test_idx <- setdiff(seq_len(nrow(surv_data)), train_idx)
+
+train_data <- surv_data[train_idx, ]
+test_data <- surv_data[test_idx, ]
+
+```
+
+# Metrics Functions
+```{r}
+calculate_cindex <- function(pred, time, status) {
+  survival::concordance(Surv(time, status) ~ pred)$concordance
+}
+
+
+```
+
+# GBM Survival Model
+```{r}
+build_gbm_survival_model <- function(train_data, test_data,
+    n.trees = 500, interaction.depth = 3, shrinkage = 0.01, n.minobsinnode = 5) {
+
+  predictors <- setdiff(colnames(train_data), c("survival_time", "event"))
+  form <- as.formula(paste("Surv(survival_time, event) ~", paste(predictors, collapse = " + ")))
+
+  gbm_model <- gbm(
+    form, data = train_data, distribution = "coxph",
+    n.trees = n.trees, interaction.depth = interaction.depth,
+    shrinkage = shrinkage, n.minobsinnode = n.minobsinnode,
+    bag.fraction = 1, verbose = FALSE
+  )
+
+  pred <- predict(gbm_model, newdata = test_data, n.trees = n.trees, type = "link")
+  test_data$risk_score <- pred
+
+  # 1-year survival classification
+  test_data$surv_1yr <- with(test_data, ifelse(survival_time <= 1 & event == 1, 1, 0))
+  valid <- with(test_data, survival_time >= 1 | (survival_time < 1 & event == 1))
+
+  auc_val <- NA
+  if (sum(valid) > 10) {
+    roc_obj <- pROC::roc(test_data$surv_1yr[valid], test_data$risk_score[valid])
+    auc_val <- as.numeric(pROC::auc(roc_obj))
+  }
+
+  list(
+    model = gbm_model,
+    test_data = test_data,
+    cindex = calculate_cindex(pred, test_data$survival_time, test_data$event),
+    auc = auc_val
+  )
+}
+
+
+gbm_res <- build_gbm_survival_model(train_data, test_data)
+```
+
+# Visualizations
+```{r}
+# Risk score density
+density_plot <- ggplot(gbm_res$test_data, aes(x = risk_score, fill = factor(event))) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(values = c("0" = "forestgreen", "1" = "firebrick")) +
+  theme_minimal() + labs(title = "Risk Score Distribution", x = "Risk Score")
+
+# ROC curve for 1-year mortality
+gbm_res$test_data$surv_1yr <- with(gbm_res$test_data, ifelse(survival_time <= 1 & event == 1, 1, 0))
+valid <- with(gbm_res$test_data, survival_time >= 1 | (survival_time < 1 & event == 1))
+roc_plot <- if (sum(valid) > 10) {
+  roc_obj <- pROC::roc(gbm_res$test_data$surv_1yr[valid], gbm_res$test_data$risk_score[valid])
+  auc_val <- as.numeric(pROC::auc(roc_obj))
+  ggroc(roc_obj) + geom_abline(linetype = "dashed") + theme_minimal() + labs(title = "ROC for 1-Year Mortality", subtitle = paste("AUC =", round(auc_val, 3)))
+} else {
+  ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Not enough samples for ROC") + theme_void()
+}
+
+# Variable importance
+varimp_plot <- ggplot(gbm_res$var_importance[1:20,], aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_col(fill = "steelblue") + coord_flip() + theme_minimal() +
+  labs(title = "Top 20 Variables", x = "Gene", y = "Relative Importance")
+
+# PDPs
+top_vars <- head(gbm_res$var_importance$var, 3)
+pdp_plots <- lapply(top_vars, function(v) {
+  pd <- partial(gbm_res$model, pred.var = v, n.trees = gbm_res$model$n.trees, train = train_data)
+  autoplot(pd) + ggtitle(paste("Partial Dependence:", v)) + theme_minimal()
+})
+
+```
+
+# Metrics Table
+```{r}
+metrics <- data.frame(
+  Metric = c("C-index", "AUC (1-Year Mortality)"),
+  Value = c(round(gbm_res$cindex, 3), ifelse(is.na(gbm_res$auc), "Not enough samples", round(gbm_res$auc, 3)))
+)
+knitr::kable(metrics, caption = "GBM Model Evaluation Metrics")
+```
+
+# Show All Plots
+```{r}
+print(km_plot)
+print(density_plot)
+print(roc_plot)
+print(varimp_plot)
+for (p in pdp_plots) print(p)
+```

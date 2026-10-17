@@ -1,0 +1,210 @@
+---
+title: "4nn"
+format:
+  html:
+    code-tools: true
+    code-fold: true
+    fig_caption: yes
+    number_sections: yes
+    embed-resources: true
+    theme: flatly
+    css: 
+      - https://use.fontawesome.com/releases/v5.0.6/css/all.css
+    toc: true
+    toc_depth: 4
+    toc_float: true
+execute:
+  echo: true
+  tidy: true
+---
+
+# Loading Libraries and Data
+
+```{r message=FALSE, warning=FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+library(limma)
+library(ggplot2)
+library(reshape2)
+library(pheatmap)
+library(viridis)
+library(caret)
+library(class)
+library(e1071)
+
+# Load the SKCM data
+load("SKCM.rda")
+```
+
+# Prepare data
+
+```{r}
+# Extract batch information from TCGA barcodes
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) { 
+  if (length(x) >= 6) 
+    return(x[6]) 
+  else 
+    return(NA)
+})
+batch_id <- as.factor(batch)
+
+# Extract clinical and create survival
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(patient, gender, vital_status, days_to_death, 
+               ajcc_pathologic_stage, age_at_diagnosis) %>%
+  mutate(
+    survival_time = days_to_death / 365,
+    event = ifelse(vital_status == "Dead", 1, 0),
+    age_years = age_at_diagnosis / 365
+  )
+
+# Add batch information to clinical data
+clinical$batch_id <- batch_id
+rownames(clinical) <- ids
+
+# Get FPKM-UQ expression data and log2 transform
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+log_expr <- log2(fpkm + 1)
+
+# Filter low-expressed genes
+gene_means <- rowMeans(log_expr)
+expressed_genes <- which(gene_means > 1)  # Keep genes with average log2(FPKM+1) > 1
+log_expr_filtered <- log_expr[expressed_genes, ]
+```
+
+# Batch Correction
+
+```{r}
+# Get complete samples
+complete_samples <- !is.na(batch_id) & 
+                    !is.na(clinical$survival_time) & 
+                    !is.na(clinical$gender)
+
+# Filter expression data
+log_expr_filtered_clean <- log_expr_filtered[, complete_samples]
+batch_id_clean <- batch_id[complete_samples]
+clinical_clean <- clinical[complete_samples, ]
+
+# survival groups based on quartiles
+surv_quartiles <- quantile(clinical_clean$survival_time, 
+                          probs = c(0, 0.25, 0.5, 0.75, 1), 
+                          na.rm = TRUE)
+
+clinical_clean$survival_group <- cut(clinical_clean$survival_time, 
+                                    breaks = surv_quartiles, 
+                                    include.lowest = TRUE, 
+                                    labels = c("Q1 (Low)", "Q2", "Q3", "Q4 (High)"))
+
+# design matrix
+design <- model.matrix(~0 + survival_group + gender, data = clinical_clean)
+colnames(design) <- c("Q1_Low", "Q2", "Q3", "Q4_High", "gender")
+
+# Apply batch correction using removeBatchEffect
+combat_expr <- removeBatchEffect(log_expr_filtered_clean, 
+                               batch = batch_id_clean,
+                               design = design)
+
+cat("Expression data dimensions after batch correction:", dim(combat_expr), "\n")
+```
+
+# Prepare data
+
+```{r}
+# Select top variable genes
+gene_vars <- apply(combat_expr, 1, var)
+top_var_genes <- order(gene_vars, decreasing = TRUE)[1:2000]
+expr_top_var <- combat_expr[top_var_genes, ]
+
+# PCA
+pca_result <- prcomp(t(expr_top_var), scale = TRUE)
+var_explained <- (pca_result$sdev^2) / sum(pca_result$sdev^2) * 100
+
+# keep 80% of variance PCs
+cum_var <- cumsum(var_explained)
+n_pcs <- which(cum_var >= 80)[1]
+cat("Number of PCs explaining 80% of variance:", n_pcs, "\n")
+
+# Create df with PCs and survival group
+pca_data <- as.data.frame(pca_result$x[, 1:n_pcs])
+pca_data$survival_group <- clinical_clean$survival_group
+
+# Remove rows with NAs
+pca_data_complete <- pca_data[complete.cases(pca_data), ]
+```
+
+# Implement 4NN Classification
+
+```{r}
+# Split data
+set.seed(123)
+train_index <- createDataPartition(pca_data_complete$survival_group, p = 0.7, list = FALSE)
+train_data <- pca_data_complete[train_index, ]
+test_data <- pca_data_complete[-train_index, ]
+
+# Extract features and labels
+train_features <- train_data[, 1:(ncol(train_data)-1)]
+train_labels <- train_data$survival_group
+test_features <- test_data[, 1:(ncol(test_data)-1)]
+test_labels <- test_data$survival_group
+
+# 4NN classification
+knn_pred <- knn(
+  train = train_features,
+  test = test_features,
+  cl = train_labels,
+  k = 4
+)
+
+# Calculate confusion matrix and performance metrics
+conf_matrix <- confusionMatrix(knn_pred, test_labels)
+print(conf_matrix)
+```
+
+# Visualization & Evaluation
+
+```{r}
+# Plot confusion matrix
+conf_data <- as.data.frame(conf_matrix$table)
+names(conf_data) <- c("Actual", "Predicted", "Frequency")
+
+ggplot(conf_data, aes(x = Predicted, y = Actual, fill = Frequency)) +
+  geom_tile() +
+  geom_text(aes(label = Frequency), color = "black") +
+  scale_fill_viridis() +
+  theme_minimal() +
+  labs(title = "4NN Confusion Matrix", 
+       x = "Predicted Class", 
+       y = "Actual Class")
+
+# PCAs
+test_results <- test_data
+test_results$predicted <- knn_pred
+
+# Plot by actual class
+p1 <- ggplot(test_results, aes(x = PC1, y = PC2, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  scale_color_viridis_d() +
+  theme_minimal() +
+  labs(title = "PCA Plot - Actual Survival Groups",
+       x = paste0("PC1 (", round(var_explained[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_explained[2], 1), "%)"),
+       color = "Survival Group")
+
+# Plot by predicted class
+p2 <- ggplot(test_results, aes(x = PC1, y = PC2, color = predicted)) +
+  geom_point(size = 3, alpha = 0.7) +
+  scale_color_viridis_d() +
+  theme_minimal() +
+  labs(title = "PCA Plot - Predicted Survival Groups",
+       x = paste0("PC1 (", round(var_explained[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_explained[2], 1), "%)"),
+       color = "Predicted Group")
+
+# Print plots
+print(p1)
+print(p2)
+```

@@ -1,0 +1,187 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(limma)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(sva)
+library(reshape2)
+library(caret)
+library(glmnet)
+
+data <- load("D:/SKCM.rda")
+
+# Extract clinical data
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(gender, vital_status, days_to_death, 
+               ajcc_pathologic_stage, age_at_diagnosis)
+
+# Create proper survival object
+clinical <- clinical %>%
+  mutate(
+    # Calculate survival time in years
+    survival_time = ifelse(vital_status == "Alive", NA, days_to_death / 365),
+    event = ifelse(vital_status == "Dead", 1, 0),
+    
+    # Convert age to years
+    age_diagnosis = age_at_diagnosis / 365
+  ) %>%
+  # Handle missing values
+  mutate(
+    age_diagnosis = ifelse(is.na(age_diagnosis), median(age_diagnosis, na.rm = TRUE), age_diagnosis),
+    # ajcc_pathologic_stage = ifelse(is.na(ajcc_pathologic_stage), "Unknown", ajcc_pathologic_stage)
+  )
+
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+
+log_expr <- log2(fpkm + 1)
+```
+```{r}
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) {
+  if (length(x) >= 6) return(x[6]) else return(NA)
+})
+
+
+gene_var <- apply(log_expr, 1, var)
+log_expr_filtered <- log_expr[gene_var > 0, ]
+```
+
+```{r}
+# ComBat 
+modcombat <- model.matrix(~1, data = data.frame(batch = batch))
+combat_expr <- ComBat(dat = as.matrix(log_expr_filtered),
+                      batch = batch,
+                      mod = modcombat,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+```
+
+```{r}
+# Filter to ensure the samples match between clinical and gene expression data
+combat_expr_filtered <- combat_expr[, rownames(clinical)]
+
+# Convert relevant character variables to factors
+clinical$gender <- as.factor(clinical$gender)
+clinical$ajcc_pathologic_stage <- as.factor(clinical$ajcc_pathologic_stage)
+clinical$vital_status <- as.factor(clinical$vital_status)
+```
+
+###Fit Cox Model
+```{r}
+# Create a data frame with gene expression data
+gene_expr <- log_expr_filtered
+
+# Perform univariate Cox regression for each gene
+gene_pvals <- apply(gene_expr, 1, function(gene) {
+  # Create a data frame with survival and gene expression data
+  df <- data.frame(
+    time = clinical$survival_time,
+    status = clinical$event,
+    gene = gene
+  )
+  
+  # Fit the Cox model and extract the p-value for the gene
+  tryCatch({
+    coxph_res <- coxph(Surv(time, status) ~ gene, data = df)
+    summary(coxph_res)$coefficients["gene", "Pr(>|z|)"]
+  }, error = function(e) NA)  # Handle errors in case of failed fitting
+})
+
+# Sort genes by p-value (smallest p-value first)
+top_20_genes_pvalue <- names(sort(gene_pvals, na.last = NA))[1:10]
+
+# Filter gene expression data for these 20 genes
+gene_expr_filtered <- gene_expr[top_20_genes_pvalue, ]
+
+# Now, let's create a data frame with the relevant clinical data and batch-corrected expression
+cox_data <- cbind(clinical, t(gene_expr_filtered))
+
+cox_data <- cox_data %>%
+  select(-days_to_death, -age_at_diagnosis,-vital_status)
+```
+```{r}
+# Fit Cox model with clinical and gene expression data
+cox_model_genes <- coxph(Surv(survival_time, event) ~ ., data = cox_data, na.action = "na.exclude")
+```
+```{r}
+cox_summary <- summary(cox_model_genes)
+```
+
+```{r}
+all_lp <- predict(cox_model_genes, type = "lp")
+
+# Calculate relative hazard for each patient
+all_relative_hazard <- exp(all_lp)
+
+relative_hazard_df <- data.frame(relative_hazard = all_relative_hazard)
+relative_hazard_df$log_transformed <- log10(relative_hazard_df$relative_hazard)
+
+
+# Plot using ggplot
+ggplot(relative_hazard_df, aes(x = relative_hazard)) +
+  geom_histogram(binwidth = 0.2, fill = "lightblue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Relative Hazards (Training Patients)",
+       x = "Relative Hazard", 
+       y = "Frequency") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  ) 
+```
+
+```{r}
+cox_summary <- summary(cox_model_genes)
+
+
+cox_summary$concordance[1]  
+cox_summary$concordance[2]  ）
+
+AIC(cox_model_genes)
+```
+```{r}
+cox_summary <- summary(cox_model_genes)
+
+
+loglik <- cox_summary$loglik[2]
+
+
+num_selected_genes <- sum(coef(cox_model_genes) != 0, na.rm = TRUE)
+
+
+print(loglik)
+print(num_selected_genes)
+
+```
+```{r}
+cox_summary <- summary(cox_model_genes)
+
+
+concordance <- cox_summary$concordance[1]
+se_concordance <- cox_summary$concordance[2]
+
+
+aic_val <- AIC(cox_model_genes)
+loglik <- cox_summary$loglik[2]  # full model log-likelihood
+
+
+num_selected_genes <- sum(coef(cox_model_genes) != 0, na.rm = TRUE)
+
+```
+
+```{r}
+cat("Concordance: ", round(concordance, 4), "\n")
+cat("SE Concordance: ", round(se_concordance, 4), "\n")
+cat("AIC: ", round(aic_val, 4), "\n")
+cat("Log-likelihood: ", round(loglik, 4), "\n")
+cat("# Selected Genes: ", num_selected_genes, "\n")
+```

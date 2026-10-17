@@ -1,0 +1,74 @@
+# Load packages
+library(survival)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+
+# Target genes
+target_genes <- c("ENSG00000198840.2", "ENSG00000198763.3")
+
+# Format sample names
+colnames(log_expr) <- toupper(substr(colnames(log_expr), 1, 15))
+clinical <- clinical %>% mutate(sample = toupper(substr(patient, 1, 15)))
+
+# Expression matrix
+expr_df <- as.data.frame(t(log_expr[target_genes, ]))
+expr_df <- tibble::rownames_to_column(expr_df, var = "sample")
+expr_df$sample <- gsub("\\.", "-", expr_df$sample)
+
+# Convert event
+clinical <- clinical %>%
+  mutate(event = case_when(
+    event == "Dead" ~ 1,
+    event == "Alive" ~ 0,
+    TRUE ~ as.numeric(event)
+  ))
+
+# Remove NA
+clinical_clean <- clinical %>% filter(!is.na(survival_time), !is.na(event))
+
+# Match samples
+common_samples <- intersect(clinical_clean$sample, expr_df$sample)
+cat("✅ Number of matched samples: ", length(common_samples), "\n")
+
+# Subset matched data
+clinical_final <- clinical_clean %>% filter(sample %in% common_samples)
+expr_final <- expr_df %>% filter(sample %in% common_samples)
+
+# Merge for Cox model
+cox_data <- clinical_final %>%
+  select(sample, survival_time, event, gender, age_years) %>%
+  mutate(gender = factor(gender)) %>%
+  left_join(expr_final, by = "sample") %>%
+  distinct(sample, .keep_all = TRUE) %>%
+  column_to_rownames("sample") %>%
+  na.omit()
+
+# Cox model
+cox_model <- coxph(Surv(survival_time, event) ~ gender + age_years +
+                     ENSG00000198840.2 + ENSG00000198763.3,
+                   data = cox_data)
+
+# Results
+summary_cox <- summary(cox_model)
+result_table <- summary_cox$coefficients
+conf_int <- summary_cox$conf.int
+
+result_table_clean <- data.frame(
+  Variable = rownames(result_table),
+  HR = conf_int[, "exp(coef)"],
+  Lower95CI = conf_int[, "lower .95"],
+  Upper95CI = conf_int[, "upper .95"]
+)
+
+# Forest plot
+ggplot(result_table_clean, aes(x = HR, y = Variable)) +
+  geom_point(size = 3, aes(color = HR > 1)) +
+  geom_errorbarh(aes(xmin = Lower95CI, xmax = Upper95CI), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  scale_x_log10(limits = c(0.1, 10)) +
+  scale_color_manual(values = c("blue", "red"), guide = "none") +
+  theme_minimal() +
+  labs(title = "Cox Model Forest Plot",
+       x = "Hazard Ratio (log scale)",
+       y = "Variables")

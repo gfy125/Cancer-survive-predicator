@@ -1,0 +1,577 @@
+---
+title: "Cox Prediction"
+format:
+  html:
+    code-tools: true
+    code-fold: true
+    fig_caption: yes
+    number_sections: yes
+    embed-resources: true
+    theme: flatly
+    css: 
+      - https://use.fontawesome.com/releases/v5.0.6/css/all.css
+    toc: true
+    toc_depth: 4
+    toc_float: true
+execute:
+  echo: true
+  tidy: true
+---
+
+# Loading Libraries and Data
+
+```{r warning=FALSE, message=FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(limma)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(sva)
+library(reshape2)
+library(caret)
+library(glmnet)
+
+data <- load("SKCM.rda")
+
+# Extract clinical data
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(gender, vital_status, days_to_death, 
+               ajcc_pathologic_stage, age_at_diagnosis)
+
+# Create proper survival object
+clinical <- clinical %>%
+  mutate(
+    # Calculate survival time in years
+    survival_time = ifelse(vital_status == "Alive", NA, days_to_death / 365),
+    event = ifelse(vital_status == "Dead", 1, 0),
+    
+    # Convert age to years
+    age_diagnosis = age_at_diagnosis / 365
+  ) %>%
+  # Handle missing values
+  mutate(
+    age_diagnosis = ifelse(is.na(age_diagnosis), median(age_diagnosis, na.rm = TRUE), age_diagnosis),
+    # ajcc_pathologic_stage = ifelse(is.na(ajcc_pathologic_stage), "Unknown", ajcc_pathologic_stage)
+  )
+
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+
+log_expr <- log2(fpkm + 1)
+```
+
+```{r}
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) {
+  if (length(x) >= 6) return(x[6]) else return(NA)
+})
+
+
+gene_var <- apply(log_expr, 1, var)
+log_expr_filtered <- log_expr[gene_var > 0, ]
+```
+
+# Batch Correction
+
+```{r message=FALSE}
+# ComBat 
+modcombat <- model.matrix(~1, data = data.frame(batch = batch))
+combat_expr <- ComBat(dat = as.matrix(log_expr_filtered),
+                      batch = batch,
+                      mod = modcombat,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+```
+
+# Cox Survival Model
+
+```{r}
+# Filter to ensure the samples match between clinical and gene expression data
+combat_expr_filtered <- combat_expr[, rownames(clinical)]
+
+# Convert relevant character variables to factors
+clinical$gender <- as.factor(clinical$gender)
+clinical$vital_status <- as.factor(clinical$vital_status)
+clinical$ajcc_pathologic_stage <- as.factor(clinical$ajcc_pathologic_stage)
+
+```
+
+```{r warning=FALSE}
+# Create a data frame with gene expression data
+gene_expr <- log_expr_filtered
+
+# Perform univariate Cox regression for each gene
+gene_pvals <- apply(gene_expr, 1, function(gene) {
+  # Create a data frame with survival and gene expression data
+  df <- data.frame(
+    time = clinical$survival_time,
+    status = clinical$event,
+    gene = gene
+  )
+  
+  # Fit the Cox model and extract the p-value for the gene
+  tryCatch({
+    coxph_res <- coxph(Surv(time, status) ~ gene, data = df)
+    summary(coxph_res)$coefficients["gene", "Pr(>|z|)"]
+  }, error = function(e) NA)  # Handle errors in case of failed fitting
+})
+
+# Sort genes by p-value (smallest p-value first)
+top_20_genes_pvalue <- names(sort(gene_pvals, na.last = NA))[1:20]
+
+# Filter gene expression data for these 20 genes
+gene_expr_filtered <- gene_expr[top_20_genes_pvalue, ]
+
+# Now, let's create a data frame with the relevant clinical data and batch-corrected expression
+cox_data <- cbind(clinical, t(gene_expr_filtered))
+
+cox_data <- cox_data %>%
+  select(-days_to_death, -age_at_diagnosis)
+
+```
+
+# Fit Cox Model
+
+```{r}
+# Fit Cox model with clinical and gene expression data
+cox_model_genes <- coxph(Surv(survival_time, event) ~ ., data = cox_data, na.action = "na.exclude")
+cox_summary <- summary(cox_model_genes)
+
+```
+
+## Relative Hazard Distribution
+
+```{r}
+all_lp <- predict(cox_model_genes, type = "lp")
+
+# Calculate relative hazard for each patient
+all_relative_hazard <- exp(all_lp)
+
+relative_hazard_df <- data.frame(relative_hazard = all_relative_hazard)
+relative_hazard_df$log_transformed <- log10(relative_hazard_df$relative_hazard)
+
+
+# Plot using ggplot
+ggplot(relative_hazard_df, aes(x = relative_hazard)) +
+  geom_histogram(binwidth = 0.2, fill = "lightblue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Relative Hazards (Training Patients)",
+       x = "Relative Hazard", 
+       y = "Frequency") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  ) 
+```
+
+```{r}
+# Survival curves
+surv_fit <- survfit(cox_model_genes)
+
+plot(surv_fit, 
+     main = "Survival Curve", 
+     xlab = "Time (Years)", 
+     ylab = "Survival Probability",
+     col = "blue",
+     lwd = 2,
+     xlim = c(0, 5))
+grid()
+```
+
+## Metrics
+
+| Concordance                    | Standard Error Concordance     |
+|--------------------------------|--------------------------------|
+| `r cox_summary$concordance[1]` | `r cox_summary$concordance[2]` |
+
+------------------------------------------------------------------------
+
+-   The Concordance value indicates a relatively strong agreement between the variables.
+-   The Standard Error Concordance shows how much the estimate might vary.
+
+# Predicting a New Patient
+
+```{r}
+# Clinical variables
+new_patient <- data.frame(
+  gender = "female",
+  vital_status = "Alive",
+  age_diagnosis = 48.1,
+  ajcc_pathologic_stage = "Stage IIC"    
+)
+
+# Gene expression values from your example patient (TCGA-EE-A2GU)
+gene_values <- data.frame(
+ENSG00000253648.1 = 0.00000000,
+ENSG00000105427.10 = 2.37926052,
+ENSG00000235015.1 = 0.00000000,
+ENSG00000196344.11 = 0.000000000,
+ENSG00000124466.9 = 1.3307878,
+ENSG00000143556.9 = 0.00000000,
+ENSG00000170465.10 = 0.000000000,
+ENSG00000188373.5 = 0.00000000,
+ENSG00000186081.12 = 0.512479747,
+ENSG00000186832.9 = 0.033511102
+)
+
+new_patient <- cbind(new_patient, gene_values)
+
+new_patient$gender <- factor(new_patient$gender, levels = levels(clinical$gender))
+new_patient$ajcc_pathologic_stage <- factor(new_patient$ajcc_pathologic_stage, levels = levels(clinical$ajcc_pathologic_stage))
+
+
+# Predict linear risk score
+new_patient_lp <- predict(cox_model_genes, newdata = new_patient, type = "lp")
+relative_hazard <- exp(new_patient_lp)
+relative_hazard <- as.numeric(format(relative_hazard, scientific=FALSE))
+relative_hazard <- log10(relative_hazard)
+
+```
+
+| Linear Risk Score  | Relative Hazard     |
+|--------------------|---------------------|
+| `r new_patient_lp` | `r relative_hazard` |
+
+------------------------------------------------------------------------
+
+-   Since the linear risk score is negative and fairly large, it suggests this individual has a lower risk of death compared to the baseline.
+-   Since the relative hazard is they are at very low risk of death compared to the baseline
+
+```{r}
+# Predict survival probabilities
+surv_pred <- survfit(cox_model_genes, newdata = new_patient)
+plot(surv_pred, 
+     main = "Predicted Survival for New Patient", 
+     xlab = "Time (Years)", 
+     ylab = "Survival Probability",
+     col = "blue",
+     lwd = 2)
+grid()
+
+```
+
+# NEW MODELS 
+
+## Mice
+```{r}
+library(mice)
+imp <- mice(clinical %>%
+              select(gender, vital_status, ajcc_pathologic_stage, age_diagnosis, survival_time, event),
+            m = 5, method = "pmm", seed = 123)
+
+```
+
+
+```{r}
+# Mean C-index
+mean_cindex <- mean(c_indices)
+sd_cindex <- sd(c_indices)
+
+# Frequency of selected genes
+selected_gene_counts <- table(unlist(selected_genes_list))
+selected_gene_counts <- sort(selected_gene_counts, decreasing = TRUE)
+
+# Output
+print(paste("Mean C-index across 5 imputations:", round(mean_cindex, 3)))
+print(paste("SD of C-index:", round(sd_cindex, 3)))
+print("Most frequently selected genes:")
+print(selected_gene_counts)
+
+```
+## better mice model
+
+```{r}
+# Load required libraries
+library(mice)
+library(survival)
+library(glmnet)
+library(dplyr)
+library(survcomp)
+
+# Step 1: Prepare clinical data (same as new initial Cox model)
+# Ensure categorical variables are factors
+clinical$event <- as.factor(clinical$event)
+clinical$gender <- as.factor(clinical$gender)
+clinical$vital_status <- as.factor(clinical$vital_status)
+clinical$ajcc_pathologic_stage <- as.factor(clinical$ajcc_pathologic_stage)
+
+# Validate event levels
+cat("Event levels before cleaning:\n")
+print(levels(clinical$event))
+if (!all(levels(clinical$event) %in% c("0", "1"))) {
+  warning("Unexpected event levels; cleaning to 0/1")
+  clinical$event <- factor(clinical$event, levels = c("0", "1"), exclude = NA)
+}
+
+# Simplify ajcc_pathologic_stage into Early vs. Late
+clinical <- clinical %>%
+  mutate(
+    stage_simplified = factor(
+      case_when(
+        ajcc_pathologic_stage %in% c("Stage I", "Stage IA", "Stage IB", "Stage II", "Stage IIA", "Stage IIB", "Stage IIC") ~ "Early",
+        ajcc_pathologic_stage %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC", "Stage IV", "Unknown") ~ "Late",
+        TRUE ~ NA_character_
+      ),
+      levels = c("Early", "Late")
+    )
+  )
+
+# Filter NA values and invalid survival_time
+clinical <- clinical %>%
+  filter(!is.na(survival_time) & survival_time > 0 & !is.na(event))
+cat("After filtering NAs and invalid survival_time:\n")
+cat("Summary of survival_time:\n")
+print(summary(clinical$survival_time))
+cat("Event counts:\n")
+print(table(clinical$event, useNA = "always"))
+cat("Number of events:", sum(clinical$event == "1", na.rm = TRUE), "\n")
+
+# Step 2: Impute clinical data
+imp <- mice(
+  clinical %>%
+    select(gender, vital_status, stage_simplified, age_diagnosis, survival_time, event),
+  m = 5,
+  method = c("logreg", "logreg", "logreg", "pmm", "pmm", "logreg"),
+  seed = 123,
+  printFlag = FALSE
+)
+
+# Step 3: Prepare gene expression data
+# Align log_expr_filtered with clinical samples
+log_expr_filtered <- log_expr_filtered[, rownames(clinical)]
+
+# Filter genes with non-zero variance
+gene_var <- apply(log_expr_filtered, 1, var, na.rm = TRUE)
+log_expr_filtered <- log_expr_filtered[gene_var > 0, ]
+cat("Number of genes after variance filter:", nrow(log_expr_filtered), "\n")
+
+# Standardize gene expression
+log_expr_filtered <- t(scale(t(log_expr_filtered)))
+
+# Step 4: Select genes using Lasso-Cox (pre-imputation)
+common_samples <- intersect(rownames(clinical), colnames(log_expr_filtered))
+clinical_subset <- clinical[common_samples, ]
+X <- t(log_expr_filtered[, common_samples])
+X <- X[, apply(X, 2, sd, na.rm = TRUE) > 1e-5]
+
+# Check for NAs in survival data
+cat("Checking for NAs in survival data:\n")
+cat(sum(is.na(clinical_subset$survival_time)), "NAs in survival_time\n")
+cat(sum(is.na(clinical_subset$event)), "NAs in event\n")
+
+# Validate event coercion
+cat("Validating event coercion:\n")
+event_numeric <- as.numeric(clinical_subset$event) - 1
+print(table(event_numeric, useNA = "always"))
+
+# Create Surv object
+y <- Surv(clinical_subset$survival_time, event_numeric)
+
+set.seed(123)
+tryCatch({
+  cv_fit <- cv.glmnet(X, y, family = "cox", alpha = 1, nfolds = 5)
+  lasso_coef <- coef(cv_fit, s = "lambda.1se")
+  selected_genes <- rownames(lasso_coef)[as.vector(lasso_coef) != 0]
+}, error = function(e) {
+  warning("Lasso gene selection failed: ", e$message)
+  selected_genes <- character(0)
+})
+
+if (length(selected_genes) == 0) {
+  warning("No genes selected by Lasso; using top 3 genes by variance")
+  selected_genes <- names(sort(gene_var, decreasing = TRUE))[1:3]
+}
+cat("Selected genes:", selected_genes, "\n")
+
+# Subset gene expression
+selected_expr <- log_expr_filtered[selected_genes, , drop = FALSE]
+selected_expr_t <- t(selected_expr)
+
+# Step 5: Fit Lasso-Cox model for each imputation
+lasso_models <- list()
+c_indices <- numeric(5)
+selected_predictors_list <- list()
+
+for (i in 1:5) {
+  # Get imputed clinical data
+  clin_imp_i <- complete(imp, i)
+  
+  # Ensure row names match
+  clin_imp_i <- clin_imp_i[rownames(clinical), ]
+  
+  # Combine clinical and gene expression data
+  common_patients <- intersect(rownames(clin_imp_i), rownames(selected_expr_t))
+  cox_data <- cbind(
+    clin_imp_i[common_patients, ] %>% select(gender, stage_simplified, age_diagnosis, survival_time, event),
+    selected_expr_t[common_patients, , drop = FALSE]
+  )
+  
+  # Ensure categorical variables are factors
+  cox_data$gender <- as.factor(cox_data$gender)
+  cox_data$stage_simplified <- as.factor(cox_data$stage_simplified)
+  cox_data$event <- as.factor(cox_data$event)
+  
+  # Filter valid rows
+  valid_idx <- which(cox_data$survival_time > 0 & !is.na(cox_data$event))
+  if (length(valid_idx) == 0) {
+    warning(paste("No valid rows for imputation", i))
+    c_indices[i] <- NA
+    next
+  }
+  cox_data_valid <- cox_data[valid_idx, ]
+  
+  # Convert event to numeric for glmnet
+  cox_data_valid$event <- as.numeric(cox_data_valid$event) - 1
+  
+  # Validate data
+  if (any(cox_data_valid$survival_time <= 0, na.rm = TRUE) || any(is.na(cox_data_valid$survival_time))) {
+    warning(paste("Invalid survival_time in imputation", i))
+    c_indices[i] <- NA
+    next
+  }
+  if (!all(cox_data_valid$event %in% c(0, 1))) {
+    warning(paste("Invalid event values in imputation", i))
+    c_indices[i] <- NA
+    next
+  }
+  
+  # Debug: Check number of events
+  cat("Imputation", i, "events:", sum(cox_data_valid$event == 1), "\n")
+  
+  # Prepare input for glmnet
+  x <- cox_data_valid %>% select(-survival_time, -event)
+  y <- Surv(cox_data_valid$survival_time, cox_data_valid$event)
+  
+  # Convert to numeric matrix
+  x <- model.matrix(~ . - 1, data = as.data.frame(x))
+  
+  # Cross-validated Lasso-Cox
+  tryCatch({
+    cv_fit <- cv.glmnet(x, y, family = "cox", alpha = 1, nfolds = 5)
+    best_lambda <- cv_fit$lambda.1se
+    lasso_model <- glmnet(x, y, family = "cox", alpha = 1, lambda = best_lambda, maxit = 1000)
+    
+    # Save model
+    lasso_models[[i]] <- lasso_model
+    
+    # Save selected predictors
+    selected_coefs <- coef(lasso_model)
+    selected_predictors <- selected_coefs[selected_coefs != 0]
+    selected_predictors_list[[i]] <- names(selected_predictors)
+    
+    # Predict linear predictor
+    lp <- predict(lasso_model, newx = x, type = "link")
+    
+    # Compute C-index
+    c_index <- concordance.index(x = lp, surv.time = cox_data_valid$survival_time, surv.event = cox_data_valid$event, method = "noether")
+    c_indices[i] <- c_index$c.index
+  }, error = function(e) {
+    warning(paste("Error in glmnet for imputation", i, ":", e$message))
+    c_indices[i] <- NA
+  })
+}
+
+# Step 6: Summarize results
+mean_cindex <- mean(c_indices, na.rm = TRUE)
+sd_cindex <- sd(c_indices, na.rm = TRUE)
+
+selected_predictor_counts <- table(unlist(selected_predictors_list))
+selected_predictor_counts <- sort(selected_predictor_counts, decreasing = TRUE)
+
+cat("Mean C-index across 5 imputations:", round(mean_cindex, 3), "\n")
+cat("SD of C-index:", round(sd_cindex, 3), "\n")
+cat("Most frequently selected predictors:\n")
+print(selected_predictor_counts)
+```
+```{r}
+library(mice)
+library(survival)
+library(glmnet)
+library(dplyr)
+library(survcomp)
+
+# Impute clinical data
+imp <- mice(
+  clinical %>% select(gender, vital_status, ajcc_pathologic_stage, age_diagnosis, survival_time, event),
+  m = 5,
+  method = c("logreg", "logreg", "polyreg", "pmm", "pmm", "logreg"),
+  seed = 123,
+  printFlag = FALSE
+)
+
+# Gene selection (same as initial model)
+log_expr_filtered <- log_expr_filtered[, rownames(clinical)]
+gene_var <- apply(log_expr_filtered, 1, var, na.rm = TRUE)
+log_expr_filtered <- log_expr_filtered[gene_var > 0, ]
+log_expr_filtered <- t(scale(t(log_expr_filtered)))
+
+common_samples <- intersect(rownames(clinical), colnames(log_expr_filtered))
+clinical_subset <- clinical[common_samples, ]
+X <- t(log_expr_filtered[, common_samples])
+X <- X[, apply(X, 2, sd, na.rm = TRUE) > 1e-5]
+y <- Surv(clinical_subset$survival_time, as.numeric(clinical_subset$event))
+
+set.seed(123)
+cv_fit <- cv.glmnet(X, y, family = "cox", alpha = 1)
+lasso_coef <- coef(cv_fit, s = "lambda.min")
+selected_genes <- rownames(lasso_coef)[as.vector(lasso_coef) != 0]
+
+selected_expr <- log_expr_filtered[selected_genes, , drop = FALSE]
+selected_expr_t <- t(selected_expr)
+
+# Fit Lasso-Cox for each imputation
+lasso_models <- list()
+c_indices <- numeric(5)
+selected_predictors_list <- list()
+
+for (i in 1:5) {
+  clin_imp_i <- complete(imp, i)
+  clin_imp_i <- clin_imp_i[rownames(clinical), ]
+  common_patients <- intersect(rownames(clin_imp_i), rownames(selected_expr_t))
+  cox_data <- cbind(
+    clin_imp_i[common_patients, ] %>% select(gender, ajcc_pathologic_stage, age_diagnosis, survival_time, event),
+    selected_expr_t[common_patients, , drop = FALSE]
+  )
+  
+  cox_data$gender <- as.factor(cox_data$gender)
+  cox_data$ajcc_pathologic_stage <- as.factor(cox_data$ajcc_pathologic_stage)
+  cox_data$event <- as.numeric(cox_data$event)
+  
+  x <- model.matrix(~ gender + ajcc_pathologic_stage + age_diagnosis - 1, data = cox_data)
+  x <- cbind(x, as.matrix(cox_data[, selected_genes, drop = FALSE]))
+  y <- Surv(cox_data$survival_time, cox_data$event)
+  
+  tryCatch({
+    cv_fit <- cv.glmnet(x, y, family = "cox", alpha = 1)
+    best_lambda <- cv_fit$lambda.min
+    lasso_model <- glmnet(x, y, family = "cox", alpha = 1, lambda = best_lambda)
+    
+    lasso_models[[i]] <- lasso_model
+    selected_coefs <- coef(lasso_model)
+    selected_predictors <- selected_coefs[selected_coefs != 0]
+    selected_predictors_list[[i]] <- names(selected_predictors)
+    
+    lp <- predict(lasso_model, newx = x, type = "link")
+    c_index <- concordance.index(x = lp, surv.time = cox_data$survival_time, surv.event = cox_data$event, method = "noether")
+    c_indices[i] <- c_index$c.index
+  }, error = function(e) {
+    warning(paste("Error in glmnet for imputation", i, ":", e$message))
+    c_indices[i] <- NA
+  })
+}
+
+# Summarize results
+mean_cindex <- mean(c_indices, na.rm = TRUE)
+sd_cindex <- sd(c_indices, na.rm = TRUE)
+selected_predictor_counts <- table(unlist(selected_predictors_list))
+selected_predictor_counts <- sort(selected_predictor_counts, decreasing = TRUE)
+
+cat("Mean C-index across 5 imputations:", round(mean_cindex, 3), "\n")
+cat("SD of C-index:", round(sd_cindex, 3), "\n")
+cat("Most frequently selected predictors:\n")
+print(selected_predictor_counts)
+```
+

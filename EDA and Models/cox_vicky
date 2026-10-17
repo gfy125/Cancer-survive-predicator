@@ -1,0 +1,170 @@
+# Extract clinical data
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(gender, vital_status, days_to_death, days_to_last_follow_up, 
+               ajcc_pathologic_stage, age_at_diagnosis)
+
+# Create survival object and clean data
+clinical <- clinical %>%
+  mutate(
+    # Define survival time: use days_to_last_follow_up if patient is alive
+    survival_time = ifelse(vital_status == "Alive", days_to_last_follow_up / 365, days_to_death / 365),
+    event = ifelse(vital_status == "Dead", 1, 0),
+    age_diagnosis = age_at_diagnosis / 365
+  ) %>%
+  mutate(
+    age_diagnosis = ifelse(is.na(age_diagnosis), median(age_diagnosis, na.rm = TRUE), age_diagnosis)
+  )
+
+# Extract gene expression and apply log2 transformation
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+log_expr <- log2(fpkm + 1)
+
+# Batch extraction
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) {
+  if (length(x) >= 6) return(x[6]) else return(NA)
+})
+
+# Filter genes with zero variance
+gene_var <- apply(log_expr, 1, var)
+log_expr_filtered <- log_expr[gene_var > 0, ]
+```
+
+```{r}
+# Batch correction using ComBat
+modcombat <- model.matrix(~1, data = data.frame(batch = batch))
+combat_expr <- ComBat(dat = as.matrix(log_expr_filtered),
+                      batch = batch,
+                      mod = modcombat,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+
+# Filter to ensure matched samples between clinical and expression data
+combat_expr <- combat_expr[, intersect(colnames(combat_expr), rownames(clinical))]
+clinical <- clinical[intersect(rownames(clinical), colnames(combat_expr)), ]
+
+# Convert relevant columns to factors
+clinical$gender <- as.factor(clinical$gender)
+clinical$vital_status <- as.factor(clinical$vital_status)
+clinical$ajcc_pathologic_stage <- as.factor(clinical$ajcc_pathologic_stage)
+
+# Subset matching expression data
+combat_expr_filtered <- combat_expr[, rownames(clinical)]
+
+```
+```{r}
+
+combat_expr_filtered <- combat_expr[, rownames(clinical)]
+
+# Perform univariate Cox regression for each gene
+combat_gene_pvals <- apply(combat_expr_filtered, 1, function(gene) {
+  # Modified: skip genes with extremely low variance to prevent infinite coefficients
+  if (sd(gene, na.rm = TRUE) < 1e-5) return(NA)  # Modified
+
+  df <- data.frame(
+    time = clinical$survival_time,
+    status = clinical$event,
+    gene = gene
+  )
+  tryCatch({
+    coxph_res <- coxph(Surv(time, status) ~ gene, data = df, ties = "breslow")  # Modified: added ties = breslow
+    summary(coxph_res)$coefficients["gene", "Pr(>|z|)"]
+  }, error = function(e) NA)
+})
+
+# Select top 10 genes with smallest p-values
+top_genes <- names(sort(combat_gene_pvals, na.last = NA))[1:10]
+selected_expr <- scale(t(combat_expr_filtered[top_genes, ]))  # Modified: apply scaling to avoid high magnitude coefficients
+
+# Combine clinical and gene expression data
+cox_data <- cbind(clinical, selected_expr)
+cox_data <- cox_data %>% select(-days_to_death, -age_at_diagnosis, -days_to_last_follow_up)
+
+# Fit Cox model
+cox_model <- coxph(Surv(survival_time, event) ~ ., data = cox_data, na.action = "na.exclude", ties = "breslow")  # Modified: added ties = breslow
+summary(cox_model)
+
+# Check proportional hazards assumption
+cox.zph(cox_model)
+```
+```{r}
+summary(new_patient)
+
+```
+```{r}
+# Predict survival and plot for a patient without missing values
+library(survival)
+library(survminer)
+
+# Select a patient with complete data (no missing values)
+new_patient <- cox_data[complete.cases(cox_data), ][1, , drop = FALSE]
+
+# Generate survival fit
+surv_fit <- survfit(cox_model, newdata = new_patient)
+
+# Plot the survival curve
+ggsurvplot(
+  surv_fit,
+  data = new_patient,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  title = "Predicted Survival for Complete Patient",
+  xlab = "Time (Years)",
+  ylab = "Survival Probability"
+)
+
+```
+```{r}
+# Plot overall Kaplan-Meier survival curve
+library(survival)
+library(survminer)
+
+km_fit <- survfit(Surv(survival_time, event) ~ 1, data = cox_data)
+
+ggsurvplot(
+  km_fit,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  title = "Kaplan-Meier Survival Curve (All Patients)",
+  xlab = "Time (Years)",
+  ylab = "Survival Probability"
+)
+
+```
+# Lasso Cox modeling with cleaned data
+library(glmnet)
+# Remove invalid samples with non-positive survival time
+valid_idx <- (clinical$survival_time > 0) & complete.cases(clinical$survival_time, clinical$event) & complete.cases(t(selected_expr))
+x <- as.matrix(selected_expr)[valid_idx, ]
+y <- Surv(clinical$survival_time[valid_idx], clinical$event[valid_idx])
+
+# Cross-validation
+cv_fit <- cv.glmnet(x, y, family = "cox", alpha = 1)
+best_lambda <- cv_fit$lambda.min
+
+# Final model
+lasso_cox_model <- glmnet(x, y, family = "cox", alpha = 1, lambda = best_lambda)
+
+# Extract selected genes
+coef_lasso <- coef(lasso_cox_model)
+selected_lasso_genes <- rownames(coef_lasso)[as.numeric(coef_lasso) != 0]
+print(selected_lasso_genes)
+
+
+```
+```{r}
+
+selected_gene <- selected_lasso_genes[1]
+
+
+cox_data$gene_group <- ifelse(cox_data[[selected_gene]] > median(cox_data[[selected_gene]], na.rm = TRUE), "High", "Low")
+
+library(survminer)
+fit <- survfit(Surv(survival_time, event) ~ gene_group, data = cox_data)
+ggsurvplot(fit,
+           data = cox_data,
+           pval = TRUE,
+           risk.table = TRUE,
+           title = paste("Survival by", selected_gene, "Expression"),
+           legend.title = "Expression Group")

@@ -1,0 +1,461 @@
+---
+title: "Cox Prediction"
+format:
+  html:
+    code-tools: true
+    code-fold: true
+    fig_caption: yes
+    number_sections: yes
+    embed-resources: true
+    theme: flatly
+    css: 
+      - https://use.fontawesome.com/releases/v5.0.6/css/all.css
+    toc: true
+    toc_depth: 4
+    toc_float: true
+execute:
+  echo: true
+  tidy: true
+---
+
+# Loading Libraries and Data
+
+```{r warning=FALSE, message=FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(biomaRt)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(limma)
+library(survival)
+library(survminer)
+library(sva)
+library(reshape2)
+library(caret)
+library(glmnet)
+library(tibble)
+library(survcomp)
+data <- load("SKCM.rda")
+clinical_followup <- read.csv("clinical_followup.csv")
+
+# Extract clinical data
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(gender, vital_status, days_to_death, 
+               ajcc_pathologic_stage, age_at_diagnosis)
+
+# Create proper survival object
+clinical <- clinical %>%
+  mutate(
+    
+    # Calculate survival time in years
+    survival_time = ifelse(vital_status == "Alive", NA, days_to_death / 365),
+    event = ifelse(vital_status == "Dead", 1, 0),
+    
+    # Convert age to years
+    age_diagnosis = age_at_diagnosis / 365
+  ) %>%
+  
+  # Handle missing values
+  mutate(
+    age_diagnosis = ifelse(is.na(age_diagnosis), median(age_diagnosis, na.rm = TRUE), age_diagnosis),
+    ajcc_pathologic_stage = ifelse(is.na(ajcc_pathologic_stage), "Unknown", ajcc_pathologic_stage)
+  )
+clinical <- clinical %>%
+  mutate(patient_barcode = str_sub(rownames(clinical), 1, 12)) %>%
+  mutate(full_barcode = rownames(clinical))
+
+followup_latest <- clinical_followup %>%
+  group_by(bcr_patient_barcode) %>%
+  filter(!is.na(days_to_last_followup)) %>%
+  slice_max(order_by = days_to_last_followup, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(bcr_patient_barcode, days_to_last_followup)
+clinical<- clinical %>%
+  left_join(followup_latest, by = c("patient_barcode" = "bcr_patient_barcode"))
+clinical <- clinical %>%
+  column_to_rownames("full_barcode")
+clinical <- clinical %>%
+  mutate(
+    days_to_death = ifelse(vital_status == "Alive", days_to_last_followup, days_to_death),
+    survival_time = ifelse(vital_status == "Alive", days_to_last_followup / 365, survival_time)
+  )
+clinical <- clinical%>%
+  dplyr::select(-patient_barcode, -days_to_last_followup, -age_at_diagnosis, -vital_status)
+clinical <- clinical %>%
+  filter(!is.na(survival_time))
+clinical <- clinical %>%
+  filter(survival_time > 0)
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+log_expr <- log2(fpkm + 1)
+```
+
+
+```{r}
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) {
+  if (length(x) >= 6) return(x[6]) else return(NA)
+})
+gene_var <- apply(log_expr, 1, var)
+log_expr_filtered <- log_expr[gene_var > 0, ]
+```
+
+# Batch Correction
+
+```{r message=FALSE}
+# ComBat 
+modcombat <- model.matrix(~1, data = data.frame(batch = batch))
+combat_expr <- ComBat(dat = as.matrix(log_expr_filtered),
+                      batch = batch,
+                      mod = modcombat,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+```
+
+# Cox Survival Model
+
+## Feature Selection
+
+```{r}
+# Convert relevant character variables to factors
+clinical$gender <- as.factor(clinical$gender)
+clinical$ajcc_pathologic_stage <- as.factor(clinical$ajcc_pathologic_stage)
+```
+
+```{r}
+gene_expr <- combat_expr
+
+# Prepare the expression matrix and survival data
+common_samples <- intersect(rownames(clinical), colnames(gene_expr))
+
+# Subset both datasets to those common samples
+X <- t(gene_expr[, common_samples])  
+
+# Remove genes with near-zero variance 
+X <- X[, apply(X, 2, sd, na.rm = TRUE) > 1e-5]
+
+# Create the survival object
+y <- Surv(clinical$survival_time, clinical$event)
+
+# Fit LASSO Cox model using cross-validation to choose lambda
+set.seed(123) 
+cv_fit <- cv.glmnet(X, y, family = "cox", alpha = 1)
+
+# Extract coefficients at the best lambda
+lasso_coef <- coef(cv_fit, s = "lambda.min")
+selected_genes <- rownames(lasso_coef)[as.vector(lasso_coef) != 0]
+
+# Subset gene expression matrix by selected genes
+selected_expr <- gene_expr[selected_genes, , drop = FALSE] 
+
+# Transpose to get patients x genes 
+selected_expr_t <- t(selected_expr)
+
+# Ensure rownames match clinical data
+common_patients <- intersect(rownames(clinical), rownames(selected_expr_t))
+
+# Subset both datasets to the common patients
+clinical_subset <- clinical[common_patients, , drop = FALSE]
+expr_subset <- selected_expr_t[common_patients, , drop = FALSE]
+
+# Combine into one data frame
+cox_data <- cbind(clinical_subset, expr_subset)
+cox_data <- cox_data %>%
+  dplyr::select(-days_to_death)
+```
+
+```{r warning=FALSE}
+# Extract coefficients at lambda.min
+coef_df <- as.data.frame(as.matrix(coef(cv_fit, s = "lambda.min")))
+coef_df$feature <- rownames(coef_df)
+colnames(coef_df)[1] <- "coefficient"
+
+# Filter non-zero coefficients
+nonzero_coef <- coef_df %>%
+  filter(coefficient != 0)
+
+# Filter gene features (Ensembl IDs)
+nonzero_genes <- nonzero_coef %>%
+  filter(str_detect(feature, "^ENSG"))
+
+# Remove version suffix from Ensembl IDs
+nonzero_genes <- nonzero_genes %>%
+  mutate(feature = str_trim(feature)) %>%
+  mutate(feature_clean = str_replace(feature, "\\..*$", ""))
+
+# Connect to Ensembl database
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+
+# Extract unique cleaned Ensembl IDs
+ensembl_ids_clean <- unique(nonzero_genes$feature_clean)
+
+# Query biomaRt for gene symbols
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = ensembl_ids_clean,
+  mart = ensembl
+) %>%
+  rename(ensembl_id = ensembl_gene_id,
+         gene_symbol = hgnc_symbol)
+
+# Join gene symbols back to nonzero_genes by cleaned feature
+if(nrow(gene_map) == 0){
+  nonzero_genes$gene_symbol <- NA_character_
+} else {
+  nonzero_genes <- nonzero_genes %>%
+    left_join(gene_map, by = c("feature_clean" = "ensembl_id"))
+}
+
+# Create plot label: use gene_symbol if available, else original feature (with version)
+nonzero_genes <- nonzero_genes %>%
+  mutate(plot_label = ifelse(is.na(gene_symbol) | gene_symbol == "", feature, gene_symbol))
+
+# Plot top genes by absolute coefficient
+top_genes <- nonzero_genes %>%
+  arrange(desc(abs(coefficient))) %>%
+  head(20)  
+ggplot(top_genes, aes(x = reorder(plot_label, coefficient), y = coefficient, fill = coefficient > 0)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("green", "red"),
+                    labels = c("Protective", "Risk"),
+                    name = "Effect") +
+  coord_flip() +
+  labs(title = "Top 20 Genes by Importance",
+       x = "Gene",
+       y = "Coefficient") +
+  theme_minimal()
+```
+
+This bar plot visualises the 20 most influential genes identified by the LASSO-regularized Cox proportional hazards model, based on their non-zero coefficients.
+
+- Positive coefficients (top half of the plot) indicate genes whose higher expression is associated with increased hazard (worse prognosis).
+
+- Negative coefficients (bottom half) indicate genes whose higher expression is associated with decreased hazard (better prognosis).
+
+- The magnitude of each coefficient reflects how strongly the gene influences the risk score in the model.
+
+# Fit Cox Model
+
+```{r}
+# Convert categorical variables to dummy variables
+gender_dummies <- model.matrix(~ gender - 1, data = cox_data)
+ajcc_stage_dummies <- model.matrix(~ ajcc_pathologic_stage - 1, data = cox_data)
+
+# Combine the dummy variables with the numeric gene expression data
+x <- cbind(cox_data[, -c(4, 5, 1, 2, 3)], gender_dummies, ajcc_stage_dummies)
+x <- as.matrix(x)
+
+# Ensure survival data is in the correct format
+y <- Surv(cox_data$survival_time, cox_data$event)
+
+# Fit the Cox model with the glmnet
+cv_fit <- cv.glmnet(x, y, family = "cox")
+lambda_min <- cv_fit$lambda.min
+cox_summary <- summary(cv_fit)
+
+# Get the linear predictors for each observation (risk scores)
+risk_scores <- predict(cv_fit, s = lambda_min, newx = x, type = "link")
+
+# Calculate concordance index
+c_index <- concordance.index(x = risk_scores,
+                             surv.time = cox_data$survival_time,
+                             surv.event = cox_data$event,
+                             method = "noether")
+```
+
+```{r}
+# Extract non-zero coefficients at lambda.min
+coef_df <- as.data.frame(as.matrix(coef(cv_fit, s = "lambda.min")))
+coef_df$feature <- rownames(coef_df)
+colnames(coef_df)[1] <- "coefficient"
+
+# Filter non-zero coefficients
+nonzero_coef <- coef_df %>%
+  filter(coefficient != 0)
+
+# Filter clinical features 
+all_clinical <- nonzero_coef %>%
+  filter(!str_detect(feature, "^ENSG"))
+all_clinical <- all_clinical %>%
+  mutate(feature = case_when(
+    str_starts(feature, "ajcc_pathologic_stage") ~ str_remove(feature, "ajcc_pathologic_stage"),
+    feature == "age_diagnosis" ~ "Age at Diagnosis",
+    TRUE ~ feature 
+  ),
+  feature = str_trim(feature))
+
+# Plot top clinical features
+ggplot(all_clinical, aes(x = reorder(feature, coefficient), y = coefficient, fill = coefficient >= 0)) +
+  geom_bar(stat = "identity") + 
+  scale_fill_manual(values = c("green", "red"),
+                  labels = c("Protective", "Risk"),
+                  name = "Effect") +
+  coord_flip() +
+  labs(title = "Clinical Feature Importance",
+       x = "Feature",
+       y = "Coefficient") +
+  theme_minimal()
+```
+
+This bar plot visualises the most influential clinical demographics identified by the LASSO-regularized Cox proportional hazards model, based on their coefficients.
+
+- Positive coefficients (top half of the plot) indicate genes whose higher expression is associated with increased hazard (worse prognosis).
+
+- Negative coefficients (bottom half) indicate genes whose higher expression is associated with decreased hazard (better prognosis).
+
+- The magnitude of each coefficient reflects how strongly the gene influences the risk score in the model.
+
+- Cofficients that are 0 indicate features that were not selected as important predictors by the model.
+
+## Linear Risk Distribution
+
+```{r}
+# Convert risk scores to a numeric vector
+risk_scores_vec <- as.vector(risk_scores)
+
+# Add to your data frame
+cox_data$linear_risk <- risk_scores_vec
+```
+
+```{r}
+ggplot(cox_data, aes(x = linear_risk)) +
+  geom_histogram(bins = 30, fill = "#ffbd59", color = "white") +
+  labs(title = "Risk Score Distribution",
+       x = "Scaled Linear Risk",
+       y = "Count") +
+  theme_minimal()
+```
+
+## Survival Fit
+
+```{r warning=FALSE}
+ggsurvplot(survfit(Surv(cox_data$survival_time, cox_data$event) ~ 1), 
+           data = cox_data, 
+           risk.table = TRUE,       
+           pval = TRUE,             
+           conf.int = TRUE,         
+           xlab = "Survival Time",  
+           ylab = "Survival Probability", 
+           title = "Survival Curve for Cox Model")
+```
+## Metrics
+
+| Concordance     |
+|-----------------|
+| `r round(c_index$c.index, 2)`| 
+-------------------
+
+- The Concordance value indicates a relatively strong agreement between the variables.
+
+# Predicting a New Patient
+
+```{r}
+# Extract the exact features used in the model
+model_features <- rownames(coef(cv_fit, s = lambda_min))
+
+# Create a data frame with just one row and all features initialized to 0
+new_patient <- data.frame(matrix(0, nrow = 1, ncol = length(model_features)))
+colnames(new_patient) <- model_features
+
+# Fill in the specific values we have for the new patient
+if("age_diagnosis" %in% colnames(new_patient)) {
+  new_patient$age_diagnosis <- 48.1
+}
+if("gendermale" %in% colnames(new_patient)) {
+  new_patient$gendermale <- 1
+}
+if("genderfemale" %in% colnames(new_patient)) {
+  new_patient$genderfemale <- 0
+}
+
+for(col in colnames(new_patient)) {
+  if(grepl("ajcc_pathologic_stage", col)) {
+    new_patient[[col]] <- 0
+  }
+}
+if("ajcc_pathologic_stageStage IIIC" %in% colnames(new_patient)) {
+  new_patient$`ajcc_pathologic_stageStage IIIC` <- 1
+}
+
+# Gene expression values
+gene_values <- list(
+  "ENSG00000108700.5" = 3.12148346,
+  "ENSG00000111206.13" = 4.109473,
+  "ENSG00000137628.17" = 2.7165280,
+  "ENSG00000140511.12" = 3.5243826,
+  "ENSG00000140519.14" = 3.243052195,
+  "ENSG00000162654.9" = 3.91157354,
+  "ENSG00000164270.18" = -3.659215e-03,
+  "ENSG00000174460.4" = 0.204181133,
+  "ENSG00000175395.16" = 1.5412538,
+  "ENSG00000182179.13" = 4.9035550,
+  "ENSG00000182568.17" = 1.690075896,
+  "ENSG00000183155.5" = 3.566287,
+  "ENSG00000200737.1" = 0.339795190,
+  "ENSG00000240793.1" = 1.096858718,
+  "ENSG00000276116.2" = 0.139672264,
+  "ENSG00000287114.1" = 0.0548535501
+)
+
+# Add gene expression values
+for(gene in names(gene_values)) {
+  if(gene %in% colnames(new_patient)) {
+    new_patient[[gene]] <- gene_values[[gene]]
+  }
+}
+
+# Convert to matrix and run prediction
+new_patient_x <- as.matrix(new_patient)
+
+# Make the prediction
+lp_new <- predict(cv_fit, newx = new_patient_x, s = lambda_min, type = "link")
+
+# Use the baseline survival curve
+fit_km <- survfit(y ~ 1)  
+
+# Calculate survival probability as baseline survival raised to exp(lp)
+surv_probs <- fit_km$surv ^ exp(lp_new)
+
+# Time in years
+time_years <- fit_km$time
+
+# Create a plot
+plot(time_years, surv_probs, type = "l", lwd = 2,
+     xlab = "Time (Years)", ylab = "Survival Probability",
+     main = "Predicted Survival for New Patient")
+```
+
+```{r}
+new_risk_score <- predict(cv_fit, s = lambda_min, newx = new_patient_x, type = "link")
+```
+
+## Metrics
+
+| Linear Risk Score     |
+|-----------------|
+| `r new_risk_score`| 
+-------------------
+
+# Saving
+```{r}
+# Get baseline survival function for prediction
+baseline_surv <- survfit(Surv(survival_time, event) ~ 1, data = cox_data)
+
+# Save all the necessary objects for the Shiny app
+save(
+  cv_fit,          
+  lambda_min,      
+  selected_genes,  
+  coef_df,         
+  nonzero_coef,    
+  c_index,         
+  cox_data,        
+  baseline_surv,   
+  file = "cox_trials.RData"
+)
+
+# Save only the first two columns of log_expr
+write.csv(as.data.frame(log_expr)[, 1:2], file = "sample_gene_data.csv")
+```

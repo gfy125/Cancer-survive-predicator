@@ -1,0 +1,663 @@
+---
+title: "Processing"
+format:
+  html:
+    code-tools: true
+    code-fold: true
+    fig_caption: yes
+    number_sections: yes
+    embed-resources: true
+    theme: flatly
+    css: 
+      - https://use.fontawesome.com/releases/v5.0.6/css/all.css
+    toc: true
+    toc_depth: 4
+    toc_float: true
+execute:
+  echo: true
+  tidy: true
+---
+
+
+# Loading Libraries and Data
+```{r message=FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(limma)
+library(survival)
+library(survminer)
+library(ggplot2)
+```
+
+```{r}
+# Load the SKCM data
+data <- load("SKCM.rda")
+```
+
+```{r}
+# Extract clinical data
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(patient, gender, vital_status, days_to_death, 
+               ajcc_pathologic_stage, age_at_diagnosis)
+
+# Create proper survival object
+clinical <- clinical %>%
+  mutate(
+    survival_time = days_to_death / 365,
+    event = ifelse(vital_status == "Dead", 1, 0),
+    age__diagnosis = age_at_diagnosis / 365
+  )
+```
+
+```{r}
+counts <- assay(query2)                # Gene expression counts
+genes  <- rowData(query2)              # Gene info
+samples <- colData(query2)             # Clinical/sample metadata
+```
+
+
+
+# Checking Missing Values and Variable Types
+```{r}
+# Examine clinical data for missing values
+missing_clinical <- colSums(is.na(clinical))
+print(paste("Missing values in clinical data:", missing_clinical))
+
+# Check variable types in clinical data
+str(clinical)
+
+# Calculate basic statistics for expression data 
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+
+# Check missing values in expression data
+missing_expr <- sum(is.na(fpkm))
+print(paste("Missing values in expression data:", missing_expr))
+
+# Check distribution of categorical variables
+cat("\nDistribution of categorical variables:\n")
+print(table(clinical$gender, useNA = "ifany"))
+print(table(clinical$vital_status, useNA = "ifany"))
+print(table(clinical$ajcc_pathologic_stage, useNA = "ifany"))
+```
+
+
+# Distribution of Median Gene Expression
+```{r}
+# Get median expression per gene
+median_expr <- rowMedians(fpkm)
+hist(log2(median_expr + 1), main="Distribution of Median Gene Expression", 
+     xlab="log2(FPKM + 1)")
+```
+
+
+
+# Melonoma Genes Expression Analysis
+```{r}
+# Get top 10 most highly expressed genes
+top_10_genes <- order(median_expr, decreasing = TRUE)[1:10]
+top_10_ids <- rowData(query2)$gene_id[top_10_genes]
+top_10_names <- rowData(query2)$gene_name[top_10_genes]
+
+# Create a data frame with both name and ID
+top_genes_df <- data.frame(
+  Rank = 1:10,
+  Gene_Name = top_10_names,
+  Ensembl_ID = top_10_ids
+)
+
+# Display the table
+print(top_genes_df)
+
+# Extract expression for top genes
+top_expr <- log2(fpkm[top_10_genes, ] + 1)
+rownames(top_expr) <- top_10_names
+
+# Create boxplots of expression by stage
+top_expr_df <- as.data.frame(t(top_expr))
+top_expr_df$stage <- colData(query2)$ajcc_pathologic_stage
+
+# Reshape for ggplot
+library(reshape2)
+top_expr_long <- melt(top_expr_df, id.vars = "stage", 
+                     variable.name = "gene", value.name = "expression")
+
+# Plot
+ggplot(na.omit(top_expr_long), aes(x = gene, y = expression, fill = stage)) +
+  geom_boxplot() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Expression of Top 10 Genes by Stage", 
+       y = "log2(FPKM + 1)", x = "Gene")
+
+# Print the names of the top 10 genes
+cat("Top 10 expressed genes:", paste(top_10_names, collapse=", "))
+```
+
+
+
+# EDA by survival
+
+## Survival by Cancer Stage
+```{r}
+ggplot(na.omit(clinical), aes(x = ajcc_pathologic_stage, y = survival_time, fill = ajcc_pathologic_stage)) +
+  geom_boxplot() +
+  labs(title = "Survival by Cancer Stage", x = "AJCC Pathologic Stage", 
+       y = "Survival (years)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+# Other EDA with age and gender
+
+## Age Distribution
+```{r}
+# Basic data structure exploration
+dim(query2)  # Get dimensions (genes × samples)
+summary(colData(query2))  # Summary of sample metadata
+table(colData(query2)$vital_status)  # Count of alive vs deceased patients
+table(colData(query2)$gender)  # Distribution by gender
+hist(colData(query2)$days_to_birth/-365, main="Age Distribution", xlab="Age (years)")
+```
+
+## Age vs Cancer Stage
+```{r}
+# Create boxplot of age vs cancer stage
+ggplot(na.omit(clinical), 
+       aes(x = ajcc_pathologic_stage, y = age__diagnosis, fill = ajcc_pathologic_stage)) +
+  geom_boxplot() +
+  labs(title = "Age Distribution by Cancer Stage", 
+       x = "AJCC Pathologic Stage", 
+       y = "Age at Diagnosis (years)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+# Statistical test for age differences between stages
+age_stage_test <- aov(age__diagnosis ~ ajcc_pathologic_stage, data = clinical)
+print(summary(age_stage_test))
+# Mean age by stage
+clinical %>%
+  group_by(ajcc_pathologic_stage) %>%
+  summarize(
+    n = n(),
+    mean_age = mean(age__diagnosis, na.rm = TRUE),
+    sd_age = sd(age__diagnosis, na.rm = TRUE)
+  ) %>%
+  arrange(ajcc_pathologic_stage) %>%
+  print()
+```
+
+# PCAs
+```{r}
+complete_cases <- complete.cases(clinical$vital_status, clinical$survival_time)
+
+# Filter log expression and clinical data
+log_expr_complete <- log2(fpkm[, complete_cases] + 1)
+top_var_genes <- order(rowVars(log_expr_complete), decreasing = TRUE)[1:1000]
+
+# PCA on selected top variable genes
+pca_result <- prcomp(t(log_expr_complete[top_var_genes, ]), scale. = TRUE)
+
+# Make sure survival_bin is already in clinical
+clinical$survival_time <- as.numeric(as.character(clinical$survival_time))
+clinical$survival_bin <- cut(
+  clinical$survival_time,
+  breaks = c(-Inf, 1, 3, Inf),
+  labels = c("<1 year", "1-3 years", ">3 years")
+)
+
+# Create PCA dataframe
+pca_df <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  PC3 = pca_result$x[, 3],
+  PC4 = pca_result$x[, 4],
+  age = clinical$age__diagnosis[complete_cases],
+  gender = clinical$gender[complete_cases],
+  survival = clinical$survival_time[complete_cases],
+  survival_bin = clinical$survival_bin[complete_cases]
+)
+
+
+# Plot PCA colored by stage
+ggplot(na.omit(pca_df), aes(x = PC1, y = PC2, color = survival)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of Survival", x = "PC1", y = "PC2") +
+  theme_minimal()
+
+# PCA by age groups
+pca_df$age_group <- cut(pca_df$age, 
+                        breaks = c(0, 25, 50, 75, 100), 
+                        labels = c("<25", "25-50", "50-75", ">75"))
+ggplot(na.omit(pca_df), aes(x = PC1, y = PC2, color = age_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of Age", x = "PC1", y = "PC2") +
+  theme_minimal()
+```
+
+## PCA Survival <1, 1-3, and >3 Years
+::: {.panel-tabset}
+
+## PC1 vs PC2
+
+```{r}
+# PCA by survival bins
+ggplot(na.omit(pca_df), aes(x = PC1, y = PC2, color = survival_bin)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "PCA of Survival Time Bin",
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal()
+```
+
+## PC2 vs PC3
+
+```{r}
+# PCA by survival bins
+ggplot(na.omit(pca_df), aes(x = PC2, y = PC3, color = survival_bin)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "PCA of Survival Time Bin",
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal()
+```
+
+## PC3 vs PC4
+
+```{r}
+# PCA by survival bins
+ggplot(na.omit(pca_df), aes(x = PC3, y = PC4, color = survival_bin)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "PCA of Survival Time Bin",
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal()
+```
+
+:::
+
+## PCA 2 Survival Time Bins
+::: {.panel-tabset}
+
+## PC1 vs PC2
+```{r}
+# Define survival threshold (e.g., median split)
+surv_median <- median(clinical$survival_time, na.rm = TRUE)
+
+# Add survival group to clinical data
+clinical$survival_group <- ifelse(clinical$survival_time > surv_median, "High", "Low")
+
+# Match clinical to PCA samples
+pca_df$survival_group <- clinical$survival_group[match(rownames(pca_df), rownames(clinical))]
+
+# Plot PCA colored by survival group
+ggplot(na.omit(pca_df), aes(x = PC1, y = PC2, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of SKCM Samples by Survival Group", 
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal() +
+  scale_color_manual(values = c("High" = "#1f78b4", "Low" = "#e31a1c"))
+```
+
+## PC2 vs PC3
+```{r}
+# Define survival threshold (e.g., median split)
+surv_median <- median(clinical$survival_time, na.rm = TRUE)
+
+# Add survival group to clinical data
+clinical$survival_group <- ifelse(clinical$survival_time > surv_median, "High", "Low")
+
+# Match clinical to PCA samples
+pca_df$survival_group <- clinical$survival_group[match(rownames(pca_df), rownames(clinical))]
+
+# Plot PCA colored by survival group
+ggplot(na.omit(pca_df), aes(x = PC2, y = PC3, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of SKCM Samples by Survival Group", 
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal() +
+  scale_color_manual(values = c("High" = "#1f78b4", "Low" = "#e31a1c"))
+```
+
+## PC3 vs PC4
+```{r}
+# Define survival threshold (e.g., median split)
+surv_median <- median(clinical$survival_time, na.rm = TRUE)
+
+# Add survival group to clinical data
+clinical$survival_group <- ifelse(clinical$survival_time > surv_median, "High", "Low")
+
+# Match clinical to PCA samples
+pca_df$survival_group <- clinical$survival_group[match(rownames(pca_df), rownames(clinical))]
+
+# Plot PCA colored by survival group
+ggplot(na.omit(pca_df), aes(x = PC3, y = PC4, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of SKCM Samples by Survival Group", 
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal() +
+  scale_color_manual(values = c("High" = "#1f78b4", "Low" = "#e31a1c"))
+```
+
+:::
+
+## PCA 3 Survival Time Bins
+
+::: {.panel-tabset}
+
+## PC1 vs PC2
+
+```{r}
+# Define survival quantiles (3 bins: Tertiles)
+surv_tertiles <- quantile(clinical$survival_time, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+# Add survival group based on tertiles
+clinical$survival_group <- cut(clinical$survival_time, 
+                               breaks = surv_tertiles, 
+                               include.lowest = TRUE, 
+                               labels = c("T1 (Low)", "T2", "T3 (High)"))
+
+# Match clinical to PCA samples
+pca_df$survival_group <- clinical$survival_group[match(rownames(pca_df), rownames(clinical))]
+
+# Plot PCA colored by survival group (tertiles)
+ggplot(na.omit(pca_df), aes(x = PC1, y = PC2, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of SKCM Samples by Survival Tertile", 
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal() +
+  scale_color_manual(values = c("T1 (Low)" = "#e31a1c", 
+                                "T2" = "#ffbf00", 
+                                "T3 (High)" = "#1f78b4"))
+
+```
+
+
+## PC2 vs PC3
+
+```{r}
+# Define survival quantiles (3 bins: Tertiles)
+surv_tertiles <- quantile(clinical$survival_time, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+# Add survival group based on tertiles
+clinical$survival_group <- cut(clinical$survival_time, 
+                               breaks = surv_tertiles, 
+                               include.lowest = TRUE, 
+                               labels = c("T1 (Low)", "T2", "T3 (High)"))
+
+# Match clinical to PCA samples
+pca_df$survival_group <- clinical$survival_group[match(rownames(pca_df), rownames(clinical))]
+
+# Plot PCA colored by survival group (tertiles)
+ggplot(na.omit(pca_df), aes(x = PC2, y = PC3, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of SKCM Samples by Survival Tertile", 
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal() +
+  scale_color_manual(values = c("T1 (Low)" = "#e31a1c", 
+                                "T2" = "#ffbf00", 
+                                "T3 (High)" = "#1f78b4"))
+
+```
+
+## PC3 vs PC4
+
+```{r}
+# Define survival quantiles (3 bins: Tertiles)
+surv_tertiles <- quantile(clinical$survival_time, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+
+# Add survival group based on tertiles
+clinical$survival_group <- cut(clinical$survival_time, 
+                               breaks = surv_tertiles, 
+                               include.lowest = TRUE, 
+                               labels = c("T1 (Low)", "T2", "T3 (High)"))
+
+# Match clinical to PCA samples
+pca_df$survival_group <- clinical$survival_group[match(rownames(pca_df), rownames(clinical))]
+
+# Plot PCA colored by survival group (tertiles)
+ggplot(na.omit(pca_df), aes(x = PC3, y = PC4, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of SKCM Samples by Survival Tertile", 
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal() +
+  scale_color_manual(values = c("T1 (Low)" = "#e31a1c", 
+                                "T2" = "#ffbf00", 
+                                "T3 (High)" = "#1f78b4"))
+
+```
+
+:::
+
+## PCA 4 Survival Time Bins
+
+::: {.panel-tabset}
+
+## PC1 vs PC2
+
+```{r}
+# Define survival quantiles (4 bins: Quartiles)
+surv_quantiles <- quantile(clinical$survival_time, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+# Add survival group based on quartiles
+clinical$survival_group <- cut(clinical$survival_time, 
+                                breaks = surv_quantiles, 
+                                include.lowest = TRUE, 
+                                labels = c("Q1 (Low)", "Q2", "Q3", "Q4 (High)"))
+
+# Match clinical to PCA samples
+pca_df$survival_group <- clinical$survival_group[match(rownames(pca_df), rownames(clinical))]
+
+# Plot PCA colored by survival group (quartiles)
+ggplot(na.omit(pca_df), aes(x = PC1, y = PC2, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of SKCM Samples by Survival Quartile", 
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal() +
+  scale_color_manual(values = c("Q1 (Low)" = "#e31a1c", "Q2" = "#ff7f00", 
+                                "Q3" = "#ffbf00", "Q4 (High)" = "#1f78b4"))
+```
+
+## PC2 vs PC3
+
+```{r}
+# Define survival quantiles (4 bins: Quartiles)
+surv_quantiles <- quantile(clinical$survival_time, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+# Add survival group based on quartiles
+clinical$survival_group <- cut(clinical$survival_time, 
+                                breaks = surv_quantiles, 
+                                include.lowest = TRUE, 
+                                labels = c("Q1 (Low)", "Q2", "Q3", "Q4 (High)"))
+
+# Match clinical to PCA samples
+pca_df$survival_group <- clinical$survival_group[match(rownames(pca_df), rownames(clinical))]
+
+# Plot PCA colored by survival group (quartiles)
+ggplot(na.omit(pca_df), aes(x = PC2, y = PC3, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of SKCM Samples by Survival Quartile", 
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal() +
+  scale_color_manual(values = c("Q1 (Low)" = "#e31a1c", "Q2" = "#ff7f00", 
+                                "Q3" = "#ffbf00", "Q4 (High)" = "#1f78b4"))
+```
+
+
+## PC3 vs PC4
+
+```{r}
+# Define survival quantiles (4 bins: Quartiles)
+surv_quantiles <- quantile(clinical$survival_time, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+# Add survival group based on quartiles
+clinical$survival_group <- cut(clinical$survival_time, 
+                                breaks = surv_quantiles, 
+                                include.lowest = TRUE, 
+                                labels = c("Q1 (Low)", "Q2", "Q3", "Q4 (High)"))
+
+# Match clinical to PCA samples
+pca_df$survival_group <- clinical$survival_group[match(rownames(pca_df), rownames(clinical))]
+
+# Plot PCA colored by survival group (quartiles)
+ggplot(na.omit(pca_df), aes(x = PC3, y = PC4, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(title = "PCA of SKCM Samples by Survival Quartile", 
+       x = "PC1", y = "PC2", color = "Survival Group") +
+  theme_minimal() +
+  scale_color_manual(values = c("Q1 (Low)" = "#e31a1c", "Q2" = "#ff7f00", 
+                                "Q3" = "#ffbf00", "Q4 (High)" = "#1f78b4"))
+```
+
+:::
+
+## Survival plots
+
+```{r message=FALSE, warning=FALSE}
+# Create survival object
+surv_obj <- Surv(clinical$survival_time, clinical$event)
+# Kaplan-Meier survival curve by gender
+fit_gender <- survfit(surv_obj ~ gender, data = clinical)
+# Log-rank test
+log_rank <- survdiff(surv_obj ~ gender, data = clinical)
+print(log_rank)
+# Create survival plot
+ggsurvplot(fit_gender, 
+           data = clinical, 
+           pval = TRUE,
+           conf.int = TRUE,
+           risk.table = TRUE,
+           risk.table.col = "strata",
+           linetype = "strata",
+           surv.median.line = "hv",
+           ggtheme = theme_minimal(),
+           palette = c("#E7B800", "#2E9FDF"),
+           title = "Kaplan-Meier Curve by Gender")
+
+# Cox proportional hazards model
+cox_gender <- coxph(surv_obj ~ gender, data = clinical)
+print(summary(cox_gender))
+```
+
+```{r}
+clinical$age_group <- cut(
+  clinical$age__diagnosis,
+  breaks = c(-Inf, 40, 60, Inf),
+  labels = c("<40", "40-60", ">60")
+)
+
+fit_age <- survfit(surv_obj ~ age_group, data = clinical)
+ggsurvplot(fit_age,
+           data = clinical,
+           pval = TRUE,
+           conf.int = TRUE,
+           risk.table = TRUE,
+           palette = "Dark2",
+           ggtheme = theme_minimal(),
+           title = "Kaplan-Meier Curve by Age Group")
+
+# Cox proportional hazards model
+cox_age <- coxph(surv_obj ~ age_group, data = clinical)
+print(summary(cox_age))
+```
+
+```{r}
+fit_stage <- survfit(surv_obj ~ ajcc_pathologic_stage, data = clinical)
+
+# Plot
+ggsurvplot(
+  fit_stage,
+  data = clinical,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  palette = "paired",
+  ggtheme = theme_minimal(),
+  title = "Kaplan-Meier Survival Curve by Age Group"
+)
+
+# Cox proportional hazards model
+cox_stage <- coxph(surv_obj ~ ajcc_pathologic_stage, data = clinical)
+print(summary(cox_stage))
+```
+
+
+
+# Candidate Genes for Modelling
+```{r message=FALSE, warning=FALSE}
+# 1. Select complete cases for survival analysis
+log_expr <- log2(fpkm + 1)
+complete_cases <- complete.cases(clinical$event, clinical$survival_time)
+clinical_complete <- clinical[complete_cases,]
+expr_complete <- log_expr[, complete_cases]
+# 2. Perform univariate Cox regression for each gene
+gene_cox_results <- data.frame(
+  gene_id = character(),
+  gene_name = character(),
+  coef = numeric(),
+  hazard_ratio = numeric(),
+  pvalue = numeric(),
+  stringsAsFactors = FALSE
+)
+set.seed(123)  # For reproducibility
+gene_subset <- sample(1:nrow(expr_complete), 1000)  # Random 1000 genes
+for (i in gene_subset) {
+  gene_expr <- expr_complete[i,]
+  gene_id <- rowData(query2)$gene_id[i]
+  gene_name <- rowData(query2)$gene_name[i]
+  
+  tryCatch({
+    cox_model <- coxph(Surv(clinical_complete$survival_time, clinical_complete$event) ~ gene_expr)
+    coef <- summary(cox_model)$coefficients[1]
+    hazard_ratio <- exp(coef)
+    pvalue <- summary(cox_model)$coefficients[5]
+    
+    gene_cox_results <- rbind(gene_cox_results, data.frame(
+      gene_id = gene_id,
+      gene_name = gene_name,
+      coef = coef,
+      hazard_ratio = hazard_ratio,
+      pvalue = pvalue
+    ))
+  }, error = function(e) {
+    # Skip genes with errors
+  })
+}
+# 3. Apply multiple testing correction
+gene_cox_results$fdr <- p.adjust(gene_cox_results$pvalue, method = "BH")
+# 4. Select significant genes
+significant_genes <- gene_cox_results %>%
+  filter(fdr < 0.05) %>%
+  arrange(fdr)
+# 5. Visualize hazard ratios for top genes
+top_cox_genes <- gene_cox_results %>%
+  arrange(pvalue) %>%
+  head(20)
+ggplot(top_cox_genes, aes(x = reorder(gene_name, hazard_ratio), 
+                         y = hazard_ratio, fill = pvalue < 0.05)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("grey", "red"), 
+                    name = "Significant (p<0.05)") +
+  labs(title = "Top 20 Genes Associated with Survival",
+       x = "Gene", 
+       y = "Hazard Ratio") +
+  theme_minimal() +
+  geom_hline(yintercept = 1, linetype = "dashed")
+# 6. Get expression patterns of top survival genes
+top_genes_expr <- expr_complete[rowData(query2)$gene_id %in% top_cox_genes$gene_id[1:5], ]
+rownames(top_genes_expr) <- top_cox_genes$gene_name[1:5]
+# Create boxplots by survival status
+top_genes_long <- melt(t(top_genes_expr), 
+                       varnames = c("Sample", "Gene"), 
+                       value.name = "Expression")
+top_genes_long$Status <- factor(clinical_complete$vital_status[top_genes_long$Sample], 
+                               levels = c("Dead", "Alive"))
+ggplot(top_genes_long, aes(x = Gene, y = Expression, fill = Status)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Expression of Top Survival Genes by Vital Status",
+       x = "Gene", 
+       y = "log2(FPKM + 1)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```

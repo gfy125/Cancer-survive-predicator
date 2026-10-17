@@ -1,0 +1,231 @@
+---
+title: "shiny"
+format: html
+editor: visual
+---
+
+
+
+# Load Libraries and Data
+
+
+
+```{r}
+library(shiny)
+library(shinydashboard)
+library(DT)
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(limma)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(sva)
+library(reshape2)
+library(caret)
+library(glmnet)
+library(stringr)
+library(tibble)
+library(survcomp)
+library(gridExtra)
+library(readxl)
+library(tools)
+
+# Load TCGA data and pretrained models
+load("SKCM.rda")      # contains query2
+load("cox_model.RData")   # contains cv_fit
+clinical_followup <- read.csv("clinical_followup.csv")
+
+
+# Data prep function
+prepare_data <- function() {
+  clinical <- colData(query2) %>% 
+    as.data.frame() %>%
+    dplyr::select(gender, vital_status, days_to_death, ajcc_pathologic_stage, age_at_diagnosis)
+
+  clinical <- clinical %>%
+    mutate(
+      survival_time = ifelse(vital_status == "Alive", NA, days_to_death / 365),
+      event = ifelse(vital_status == "Dead", 1, 0),
+      age_diagnosis = age_at_diagnosis / 365
+    ) %>%
+    mutate(
+      age_diagnosis = ifelse(is.na(age_diagnosis), median(age_diagnosis, na.rm = TRUE), age_diagnosis),
+      ajcc_pathologic_stage = ifelse(is.na(ajcc_pathologic_stage), "Unknown", ajcc_pathologic_stage)
+    ) %>%
+    mutate(patient_barcode = str_sub(rownames(clinical), 1, 12),
+           full_barcode = rownames(clinical))
+
+  followup_latest <- clinical_followup %>%
+    group_by(bcr_patient_barcode) %>%
+    filter(!is.na(days_to_last_followup)) %>%
+    slice_max(order_by = days_to_last_followup, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(bcr_patient_barcode, days_to_last_followup)
+
+  clinical <- clinical %>%
+    left_join(followup_latest, by = c("patient_barcode" = "bcr_patient_barcode")) %>%
+    column_to_rownames("full_barcode") %>%
+    mutate(
+      days_to_death = ifelse(vital_status == "Alive", days_to_last_followup, days_to_death),
+      survival_time = ifelse(vital_status == "Alive", days_to_last_followup / 365, survival_time)
+    ) %>%
+    filter(!is.na(survival_time) & survival_time > 0) %>%
+    select(-patient_barcode, -days_to_last_followup, -age_at_diagnosis)
+
+  fpkm <- assay(query2, "fpkm_uq_unstrand")
+  log_expr <- log2(fpkm + 1)
+
+  ids <- as.character(colData(query2)$barcode)
+  batch <- sapply(strsplit(ids, "-"), function(x) if (length(x) >= 6) x[6] else NA)
+
+  gene_var <- apply(log_expr, 1, var)
+  log_expr_filtered <- log_expr[gene_var > 0, ]
+
+  modcombat <- model.matrix(~1, data = data.frame(batch = batch))
+  combat_expr <- ComBat(dat = as.matrix(log_expr_filtered), batch = batch,
+                        mod = modcombat, par.prior = TRUE, prior.plots = FALSE)
+
+  list(clinical = clinical, expression = combat_expr)
+}
+```
+
+
+
+# UI
+
+
+
+```{r}
+ui <- fluidPage(
+  titlePanel("Cox Model - TCGA SKCM Prediction"),
+
+  sidebarLayout(
+    sidebarPanel(
+      numericInput("age", "Age at Diagnosis (years):", 50),
+      selectInput("gender", "Gender:", choices = c("male", "female")),
+      selectInput("vital_status", "Vital Status:", choices = c("Alive", "Dead")),
+      selectInput("stage", "AJCC Stage:", choices = c("Stage I", "Stage II", "Stage III", "Stage IV", "Unknown")),
+      actionButton("predict", "Predict")
+    ),
+
+    mainPanel(
+      plotOutput("topGenesPlot"),
+      plotOutput("topClinicalPlot"),
+      plotOutput("survivalPlot"),
+      verbatimTextOutput("cIndex"),
+      verbatimTextOutput("riskScore")
+    )
+  )
+)
+```
+
+
+
+# Server
+
+
+
+```{r}
+server <- function(input, output) {
+  data <- prepare_data()
+  clinical <- data$clinical
+  expr <- data$expression
+
+  clinical$gender <- as.factor(clinical$gender)
+  clinical$vital_status <- as.factor(clinical$vital_status)
+  clinical$ajcc_pathologic_stage <- as.factor(clinical$ajcc_pathologic_stage)
+
+  common_samples <- intersect(rownames(clinical), colnames(expr))
+  X <- t(expr[, common_samples])
+  X <- X[, apply(X, 2, sd, na.rm = TRUE) > 1e-5]
+  y <- Surv(clinical[common_samples, ]$survival_time, clinical[common_samples, ]$event)
+
+  cv_fit <- cv.glmnet(X, y, family = "cox", alpha = 1)
+  lambda_min <- cv_fit$lambda.min
+  risk_scores <- predict(cv_fit, s = lambda_min, newx = X, type = "link")
+  c_index <- concordance.index(x = risk_scores,
+                               surv.time = clinical[common_samples, ]$survival_time,
+                               surv.event = clinical[common_samples, ]$event)
+
+  coef_df <- as.data.frame(as.matrix(coef(cv_fit, s = "lambda.min")))
+  coef_df$feature <- rownames(coef_df)
+  colnames(coef_df)[1] <- "coefficient"
+  nonzero_coef <- coef_df %>% filter(coefficient != 0)
+
+  output$cIndex <- renderPrint({
+    paste("Concordance Index:", round(c_index$c.index, 3))
+  })
+
+  output$topGenesPlot <- renderPlot({
+    top_genes <- nonzero_coef %>%
+      filter(str_detect(feature, "^ENSG")) %>%
+      arrange(desc(abs(coefficient))) %>%
+      head(20)
+
+    ggplot(top_genes, aes(x = reorder(feature, coefficient), y = coefficient, fill = coefficient > 0)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      theme_minimal() +
+      labs(title = "Top 20 Genes", x = "Gene", y = "Coefficient")
+  })
+
+  output$topClinicalPlot <- renderPlot({
+    clinical_feats <- nonzero_coef %>% filter(!str_detect(feature, "^ENSG"))
+    ggplot(clinical_feats, aes(x = reorder(feature, coefficient), y = coefficient, fill = coefficient > 0)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      theme_minimal() +
+      labs(title = "Clinical Features", x = "Feature", y = "Coefficient")
+  })
+
+  observeEvent(input$predict, {
+    new_patient <- data.frame(
+      age_diagnosis = input$age,
+      genderfemale = ifelse(input$gender == "female", 1, 0),
+      gendermale = ifelse(input$gender == "male", 1, 0),
+      vital_statusAlive = ifelse(input$vital_status == "Alive", 1, 0),
+      vital_statusDead = ifelse(input$vital_status == "Dead", 1, 0),
+      "ajcc_pathologic_stageStage I" = ifelse(input$stage == "Stage I", 1, 0),
+      "ajcc_pathologic_stageStage II" = ifelse(input$stage == "Stage II", 1, 0),
+      "ajcc_pathologic_stageStage III" = ifelse(input$stage == "Stage III", 1, 0),
+      "ajcc_pathologic_stageStage IV" = ifelse(input$stage == "Stage IV", 1, 0),
+      "ajcc_pathologic_stageUnknown" = ifelse(input$stage == "Unknown", 1, 0)
+    )
+
+    # Add gene inputs with zeros (placeholder)
+    gene_feats <- nonzero_coef %>% filter(str_detect(feature, "^ENSG"))
+    for (g in gene_feats$feature) {
+      new_patient[[g]] <- 0
+    }
+
+    x_new <- as.matrix(new_patient)
+    lp <- predict(cv_fit, newx = x_new, s = lambda_min, type = "link")
+
+    fit_km <- survfit(y ~ 1)
+    surv_probs <- fit_km$surv ^ exp(lp)
+
+    output$survivalPlot <- renderPlot({
+      plot(fit_km$time, surv_probs, type = "l", lwd = 2,
+           xlab = "Time (Years)", ylab = "Survival Probability",
+           main = "Predicted Survival")
+    })
+
+    output$riskScore <- renderPrint({
+      paste("Risk Score (Linear Predictor):", round(lp, 3))
+    })
+  })
+}
+```
+
+
+
+# App
+
+
+
+```{r}
+shinyApp(ui = ui, server = server)
+```
+

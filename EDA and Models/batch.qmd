@@ -1,0 +1,578 @@
+---
+title: "Processing"
+format:
+  html:
+    code-tools: true
+    code-fold: true
+    fig_caption: yes
+    number_sections: yes
+    embed-resources: true
+    theme: flatly
+    css: 
+      - https://use.fontawesome.com/releases/v5.0.6/css/all.css
+    toc: true
+    toc_depth: 4
+    toc_float: true
+execute:
+  echo: true
+  tidy: true
+---
+
+
+# Loading Libraries and Data
+```{r message=FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+library(limma)
+library(ggplot2)
+library(reshape2)
+library(pheatmap)
+library(viridis)
+```
+
+```{r}
+# Load the SKCM data
+load("SKCM.rda")
+```
+
+
+# Exploring the Batch Variables
+```{r message=FALSE}
+# Extract batch information from TCGA barcodes
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) { 
+  if (length(x) >= 6) 
+    return(x[6]) 
+  else 
+    return(NA)
+})
+batch_id <- as.factor(batch)
+
+# Check batch distribution
+batch_counts <- table(batch_id, useNA = "ifany")
+print(batch_counts)
+
+# Create a dataframe with batch information
+batch_info <- data.frame(
+  sample = colnames(query2),
+  batch_id = batch_id,
+  stringsAsFactors = FALSE
+)
+
+# Extract essential clinical information
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(patient, gender, vital_status, days_to_death, 
+               ajcc_pathologic_stage, age_at_diagnosis)
+
+# Create proper survival object
+clinical <- clinical %>%
+  mutate(
+    survival_time = days_to_death / 365,
+    event = ifelse(vital_status == "Dead", 1, 0),
+    age_years = age_at_diagnosis / 365
+  )
+
+# Join clinical data with batch information
+clinical_with_batch <- clinical %>%
+  mutate(batch_id = batch_id)
+
+# Add survival groups for visualization
+surv_tertiles <- quantile(clinical$survival_time, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+clinical_with_batch$survival_group <- cut(clinical$survival_time, 
+                            breaks = surv_tertiles, 
+                            include.lowest = TRUE, 
+                            labels = c("Low", "Medium", "High"))
+```
+
+
+# Expression Data Pre-Processing
+```{r}
+# Get FPKM-UQ expression data
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+
+# Log2 transform expression data
+log_expr <- log2(fpkm + 1)
+
+# Check basic statistics
+summary(log_expr[1:5, 1:5])
+
+# Filter low-expressed genes
+gene_means <- rowMeans(log_expr)
+expressed_genes <- which(gene_means > 1)  # Keep genes with average log2(FPKM+1) > 1
+log_expr_filtered <- log_expr[expressed_genes, ]
+cat("Original number of genes:", nrow(log_expr), "\n")
+cat("Number of expressed genes kept:", nrow(log_expr_filtered), "\n")
+```
+
+
+# Examining Data Distribution Before Batch Correction
+
+## Overall Distribution by Batch
+```{r}
+# Create a data frame for plotting
+expr_melt <- melt(log_expr_filtered[1:1000, ], varnames = c("gene", "sample"), value.name = "expression")
+expr_melt$batch_id <- batch_info$batch_id[match(expr_melt$sample, batch_info$sample)]
+
+# Plot distribution by batch
+p1 <- ggplot(expr_melt, aes(x = expression, color = batch_id)) +
+  geom_density(alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Gene Expression Distribution by Batch (Before Correction)",
+       x = "log2(FPKM + 1)", y = "Density", color = "Batch ID")
+print(p1)
+
+# Boxplot of expression values by batch
+p2 <- ggplot(expr_melt, aes(x = batch_id, y = expression, fill = batch_id)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Distribution of Expression Values by Batch (Before Correction)",
+       x = "Batch ID", y = "log2(FPKM + 1)", fill = "Batch ID")
+print(p2)
+```
+
+## PCA Analysis Before Batch Correction
+```{r}
+# Select top variable genes for PCA
+gene_vars <- apply(log_expr_filtered, 1, var)
+top_var_genes <- order(gene_vars, decreasing = TRUE)[1:2000]
+expr_top_var <- log_expr_filtered[top_var_genes, ]
+
+# Perform PCA on top variable genes
+pca_result <- prcomp(t(expr_top_var), scale = TRUE)
+pca_data <- as.data.frame(pca_result$x[, 1:5])
+
+# Add batch and survival information
+pca_data$batch_id <- batch_id
+pca_data$survival_group <- clinical_with_batch$survival_group
+
+# Calculate variance explained
+var_explained <- (pca_result$sdev^2) / sum(pca_result$sdev^2) * 100
+
+# PCA plot by batch
+p3 <- ggplot(pca_data, aes(x = PC1, y = PC2, color = batch_id)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA of Gene Expression by Batch (Before Correction)",
+       x = paste0("PC1 (", round(var_explained[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_explained[2], 1), "%)"),
+       color = "Batch ID")
+print(p3)
+
+# PCA plot by survival group
+p4 <- ggplot(na.omit(pca_data), aes(x = PC1, y = PC2, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  labs(title = "PCA of Gene Expression by Survival Group (Before Correction)",
+       x = paste0("PC1 (", round(var_explained[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_explained[2], 1), "%)"),
+       color = "Survival Group")
+print(p4)
+```
+
+## Visualizing Additional PCs Before Correction
+```{r}
+# PC3 vs PC4 by batch
+p5 <- ggplot(pca_data, aes(x = PC3, y = PC4, color = batch_id)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PC3 vs PC4 by Batch (Before Correction)",
+       x = paste0("PC3 (", round(var_explained[3], 1), "%)"),
+       y = paste0("PC4 (", round(var_explained[4], 1), "%)"),
+       color = "Batch ID")
+print(p5)
+
+# PC3 vs PC4 by survival group
+p6 <- ggplot(na.omit(pca_data), aes(x = PC3, y = PC4, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  labs(title = "PC3 vs PC4 by Survival Group (Before Correction)",
+       x = paste0("PC3 (", round(var_explained[3], 1), "%)"),
+       y = paste0("PC4 (", round(var_explained[4], 1), "%)"),
+       color = "Survival Group")
+print(p6)
+```
+
+
+# Batch Correction using limma's removeBatchEffect
+```{r}
+complete_samples <- !is.na(batch_id) & !is.na(clinical_with_batch$survival_group) & !is.na(clinical_with_batch$gender)
+
+# Filter relevant data toinclude complete cases
+log_expr_filtered_clean <- log_expr_filtered[, complete_samples]
+batch_id_clean <- batch_id[complete_samples]
+clinical_clean <- clinical_with_batch[complete_samples, ]
+
+# design matrix based on the cleaned data
+model_df <- data.frame(
+  survival_group = clinical_clean$survival_group,
+  gender = clinical_clean$gender
+)
+
+# model matrix with right dimensions
+design <- model.matrix(~0 + survival_group + gender, data = model_df)
+colnames(design) <- c("Low", "Medium", "High", "gender")
+
+# dimensions before applying removeBatchEffect
+cat("Expression data dimensions:", dim(log_expr_filtered_clean), "\n")
+cat("Batch ID length:", length(batch_id_clean), "\n")
+cat("Design matrix dimensions:", dim(design), "\n")
+
+# removeBatchEffect with the properly aligned data
+combat_expr <- removeBatchEffect(log_expr_filtered_clean, 
+                               batch = batch_id_clean,
+                               design = design)
+```
+
+
+# Examining Data Distribution After Batch Correction
+
+## Overall Distribution by Batch After Correction
+```{r}
+# Create a data frame for plotting
+combat_melt <- melt(combat_expr[1:1000, ], varnames = c("gene", "sample"), value.name = "expression")
+combat_melt$batch_id <- batch_id[combat_melt$sample]
+
+# Plot distribution by batch after correction
+p7 <- ggplot(combat_melt, aes(x = expression, color = batch_id)) +
+  geom_density(alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Gene Expression Distribution by Batch (After Correction)",
+       x = "Corrected log2(FPKM + 1)", y = "Density", color = "Batch ID")
+print(p7)
+
+# Boxplot of expression values by batch after correction
+p8 <- ggplot(combat_melt, aes(x = batch_id, y = expression, fill = batch_id)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Distribution of Expression Values by Batch (After Correction)",
+       x = "Batch ID", y = "Corrected log2(FPKM + 1)", fill = "Batch ID")
+print(p8)
+```
+
+## PCA Analysis After Batch Correction
+```{r}
+# Select top variable genes from batch-corrected data
+combat_vars <- apply(combat_expr, 1, var)
+combat_top_var <- order(combat_vars, decreasing = TRUE)[1:2000]
+combat_top_expr <- combat_expr[combat_top_var, ]
+
+# Perform PCA on top variable genes after correction
+combat_pca <- prcomp(t(combat_top_expr), scale = TRUE)
+combat_pca_data <- as.data.frame(combat_pca$x[, 1:5])
+
+# Add batch and survival information
+combat_pca_data$batch_id <- batch_id_clean
+combat_pca_data$survival_group <- clinical_clean$survival_group
+
+# Calculate variance explained
+combat_var_explained <- (combat_pca$sdev^2) / sum(combat_pca$sdev^2) * 100
+
+# PCA plot by batch after correction
+p9 <- ggplot(combat_pca_data, aes(x = PC1, y = PC2, color = batch_id)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA of Gene Expression by Batch (After Correction)",
+       x = paste0("PC1 (", round(combat_var_explained[1], 1), "%)"),
+       y = paste0("PC2 (", round(combat_var_explained[2], 1), "%)"),
+       color = "Batch ID")
+print(p9)
+
+# PCA plot by survival group after correction
+p10 <- ggplot(na.omit(combat_pca_data), aes(x = PC1, y = PC2, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  labs(title = "PCA of Gene Expression by Survival Group (After Correction)",
+       x = paste0("PC1 (", round(combat_var_explained[1], 1), "%)"),
+       y = paste0("PC2 (", round(combat_var_explained[2], 1), "%)"),
+       color = "Survival Group")
+print(p10)
+```
+
+## Visualizing Additional PCs After Correction
+```{r}
+# PC3 vs PC4 by batch after correction
+p11 <- ggplot(combat_pca_data, aes(x = PC3, y = PC4, color = batch_id)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PC3 vs PC4 by Batch (After Correction)",
+       x = paste0("PC3 (", round(combat_var_explained[3], 1), "%)"),
+       y = paste0("PC4 (", round(combat_var_explained[4], 1), "%)"),
+       color = "Batch ID")
+print(p11)
+
+# PC3 vs PC4 by survival group after correction
+p12 <- ggplot(na.omit(combat_pca_data), aes(x = PC3, y = PC4, color = survival_group)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  labs(title = "PC3 vs PC4 by Survival Group (After Correction)",
+       x = paste0("PC3 (", round(combat_var_explained[3], 1), "%)"),
+       y = paste0("PC4 (", round(combat_var_explained[4], 1), "%)"),
+       color = "Survival Group")
+print(p12)
+```
+
+
+# Before vs After Batch Correction
+
+## Distribution Comparison
+```{r}
+# Create combined dataset for before/after comparison
+before_melt <- expr_melt
+before_melt$correction <- "Before"
+after_melt <- combat_melt
+after_melt$correction <- "After"
+
+combined_melt <- rbind(before_melt, after_melt)
+
+# Density plots comparing before and after
+p13 <- ggplot(combined_melt, aes(x = expression, color = batch_id)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~correction) +
+  theme_minimal() +
+  labs(title = "Gene Expression Distributions Before and After Batch Correction",
+       x = "log2(FPKM + 1)", y = "Density", color = "Batch ID")
+print(p13)
+
+# Boxplots comparing before and after
+p14 <- ggplot(combined_melt, aes(x = batch_id, y = expression, fill = batch_id)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~correction) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8)) +
+  labs(title = "Distribution of Expression Values Before and After Batch Correction",
+       x = "Batch ID", y = "log2(FPKM + 1)", fill = "Batch ID")
+print(p14)
+```
+
+## PCA Comparison
+```{r}
+# Create combined PCA dataset
+pca_before <- pca_data[, c("PC1", "PC2", "batch_id", "survival_group")]
+pca_before$correction <- "Before"
+
+pca_after <- combat_pca_data[, c("PC1", "PC2", "batch_id", "survival_group")]
+pca_after$correction <- "After"
+
+pca_combined <- rbind(pca_before, pca_after)
+
+# PCA by batch, before and after
+p15 <- ggplot(pca_combined, aes(x = PC1, y = PC2, color = batch_id)) +
+  geom_point(size = 2, alpha = 0.7) +
+  facet_wrap(~correction, scales = "free") +
+  theme_minimal() +
+  labs(title = "PCA by Batch ID: Before vs After Batch Correction",
+       color = "Batch ID")
+print(p15)
+
+# PCA by survival group, before and after
+p16 <- ggplot(na.omit(pca_combined), aes(x = PC1, y = PC2, color = survival_group)) +
+  geom_point(size = 2, alpha = 0.7) +
+  facet_wrap(~correction, scales = "free") +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  labs(title = "PCA by Survival Group: Before vs After Batch Correction",
+       color = "Survival Group")
+print(p16)
+```
+
+
+# Statistical Assessment of Batch Effect Removal
+```{r}
+calc_batch_effect <- function(expr_data, batch) {
+  p_values <- numeric(nrow(expr_data))
+  
+  for (i in 1:nrow(expr_data)) {
+    # ANOVA
+    fit <- aov(expr_data[i,] ~ as.factor(batch))
+    p_values[i] <- summary(fit)[[1]][["Pr(>F)"]][1]
+  }
+  
+  # Adjust for multiple testing
+  p_adj <- p.adjust(p_values, method = "BH")
+  
+  # Count significant genes
+  sig_genes <- sum(p_adj < 0.05)
+  
+  return(list(
+    sig_genes = sig_genes,
+    prop_sig_genes = sig_genes / length(p_values),
+    p_values = p_values,
+    p_adj = p_adj
+  ))
+}
+
+# Subset data
+set.seed(123)
+gene_subset <- sample(1:nrow(log_expr_filtered), 1000)
+
+# Calculate batch effect before correction
+batch_effect_before <- calc_batch_effect(log_expr_filtered[gene_subset,], batch_id)
+
+# Calculate batch effect after correction  
+batch_effect_after <- calc_batch_effect(combat_expr[gene_subset,], batch_id_clean)
+
+# Display results
+cat("Before batch correction:\n")
+cat("  Number of genes significantly affected by batch:", batch_effect_before$sig_genes, "\n")
+cat("  Proportion of genes affected:", round(batch_effect_before$prop_sig_genes * 100, 2), "%\n\n")
+
+cat("After batch correction:\n")
+cat("  Number of genes significantly affected by batch:", batch_effect_after$sig_genes, "\n")
+cat("  Proportion of genes affected:", round(batch_effect_after$prop_sig_genes * 100, 2), "%\n")
+
+# Compare p-value distributions
+p_val_df <- data.frame(
+  p_value = c(batch_effect_before$p_values, batch_effect_after$p_values),
+  Correction = rep(c("Before", "After"), each = length(gene_subset))
+)
+
+p17 <- ggplot(p_val_df, aes(x = p_value, fill = Correction)) +
+  geom_histogram(alpha = 0.5, position = "identity", bins = 30) +
+  theme_minimal() +
+  labs(title = "Distribution of Batch Effect p-values Before and After Correction",
+       x = "p-value", y = "Count")
+print(p17)
+```
+
+
+# Heatmap Visualization
+```{r}
+# Select top 50 variable genes for visualization
+top_50_var <- order(gene_vars, decreasing = TRUE)[1:50]
+
+# Create heatmap
+annotation_col <- data.frame(
+  Batch = batch_id,
+  Survival = clinical_with_batch$survival_group,
+  Gender = clinical_with_batch$gender
+)
+rownames(annotation_col) <- colnames(log_expr_filtered)
+
+# Color palettes
+ann_colors <- list(
+  Batch = viridis::viridis(length(unique(batch_id))),
+  Survival = c("Low" = "#e31a1c", "Medium" = "#ffbf00", "High" = "#1f78b4"),
+  Gender = c(female = "#ff7f0e", male = "#1f77b4")
+)
+names(ann_colors$Batch) <- levels(as.factor(batch_id))
+
+# Heatmap before batch correction
+pheatmap(log_expr_filtered[top_50_var, ], 
+         scale = "row", 
+         annotation_col = annotation_col,
+         annotation_colors = ann_colors,
+         show_rownames = FALSE, 
+         show_colnames = FALSE,
+         main = "Expression Heatmap Before Batch Correction",
+         clustering_method = "ward.D2")
+
+# Heatmap after batch correction
+pheatmap(combat_expr[top_50_var, ], 
+         scale = "row", 
+         annotation_col = annotation_col,
+         annotation_colors = ann_colors,
+         show_rownames = FALSE, 
+         show_colnames = FALSE,
+         main = "Expression Heatmap After Batch Correction",
+         clustering_method = "ward.D2")
+```
+
+
+
+
+# Effects on Biological Signal
+```{r}
+# Get top survival-associated genes 
+survival_assoc <- function(expr_data, survival_group) {
+  p_values <- numeric(nrow(expr_data))
+  
+  for (i in 1:nrow(expr_data)) {
+    # Skip genes with missing values
+    if (any(is.na(expr_data[i,]))) {
+      p_values[i] <- NA
+      next
+    }
+    
+    # Perform ANOVA for survival groups
+    fit <- aov(expr_data[i,] ~ survival_group)
+    p_values[i] <- tryCatch({
+      summary(fit)[[1]][["Pr(>F)"]][1]
+    }, error = function(e) {
+      NA
+    })
+  }
+  
+  return(p_values)
+}
+
+complete_samples <- !is.na(batch_id) & !is.na(clinical_with_batch$survival_group) & !is.na(clinical_with_batch$gender)
+clinical_clean <- clinical_with_batch[complete_samples, ]
+
+# complete_cases based on the filtered clinical data
+complete_cases_clean <- complete.cases(clinical_clean$survival_group)
+surv_group_clean <- clinical_clean$survival_group[complete_cases_clean]
+
+# Calculate survival association before correction
+surv_pvals_before <- survival_assoc(log_expr_filtered[gene_subset, complete_samples][, complete_cases_clean], surv_group_clean)
+
+# Calculate survival association after correction
+surv_pvals_after <- survival_assoc(combat_expr[gene_subset, complete_cases_clean], surv_group_clean)
+
+# Compare results
+surv_df <- data.frame(
+  gene = 1:length(gene_subset),
+  p_before = surv_pvals_before,
+  p_after = surv_pvals_after
+)
+
+# Count significant genes before and after
+sig_before <- sum(p.adjust(surv_pvals_before, method = "BH") < 0.1, na.rm = TRUE)
+sig_after <- sum(p.adjust(surv_pvals_after, method = "BH") < 0.1, na.rm = TRUE)
+
+cat("Genes significantly associated with survival (FDR < 0.1):\n")
+cat("  Before batch correction:", sig_before, "\n")
+cat("  After batch correction:", sig_after, "\n")
+
+# Plot correlation between p-values
+p18 <- ggplot(na.omit(surv_df), aes(x = -log10(p_before), y = -log10(p_after))) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "Survival Association p-values: Before vs After Batch Correction",
+       x = "-log10(p-value) Before Correction", 
+       y = "-log10(p-value) After Correction")
+print(p18)
+```
+
+
+# Summary and Conclusions
+```{r}
+batch_summary <- data.frame(
+  Metric = c(
+    "Genes Significantly Affected by Batch",
+    "% Genes Affected by Batch",
+    "Genes Associated with Survival (FDR < 0.1)"
+  ),
+  Before_Correction = c(
+    batch_effect_before$sig_genes,
+    round(batch_effect_before$prop_sig_genes * 100, 2),
+    sig_before
+  ),
+  After_Correction = c(
+    batch_effect_after$sig_genes,
+    round(batch_effect_after$prop_sig_genes * 100, 2),
+    sig_after
+  )
+)
+
+print(batch_summary, row.names = FALSE, right = FALSE)
+```

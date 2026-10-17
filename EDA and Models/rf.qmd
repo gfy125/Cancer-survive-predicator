@@ -1,0 +1,138 @@
+---
+title: "rf"
+format: html
+editor: visual
+---
+
+# Load Libraries and Data
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(randomForest)
+library(survival)
+library(pROC)
+library(dplyr)
+library(caret)
+library(ggplot2)
+```
+
+# Preparing
+
+```{r}
+# Load SKCM expression object
+load("SKCM.rda")
+
+clinical <- colData(query2) %>%
+  as.data.frame() %>%
+  select(bcr_patient_barcode, gender, vital_status, days_to_death,
+         ajcc_pathologic_stage, age_at_diagnosis) %>%
+  mutate(
+    survival_time  = days_to_death / 365,
+    event          = ifelse(vital_status == "Dead", 1, 0),
+    age_diagnosis  = age_at_diagnosis / 365
+  ) %>%
+  filter(!is.na(survival_time) & !is.na(event))
+
+log_expr <- log2(assay(query2, "fpkm_uq_unstrand") + 1)
+
+matched <- intersect(rownames(clinical), colnames(log_expr))
+clinical <- clinical[matched, ]
+log_expr <- log_expr[, matched]
+```
+
+# Feature Selection
+
+```{r}
+top1k    <- names(sort(apply(log_expr, 1, var), decreasing = TRUE))[1:1000]
+expr_filt <- log_expr[top1k, ]
+expr_mat  <- t(expr_filt)
+
+rf_data <- as.data.frame(expr_mat) %>%
+  mutate(
+    survival_time = clinical$survival_time,
+    event         = clinical$event
+  )
+```
+
+# Split data
+
+```{r}
+set.seed(42)
+evt_idx   <- which(rf_data$event == 1)
+cen_idx   <- which(rf_data$event == 0)
+train_idx <- c(
+  sample(evt_idx, round(0.7 * length(evt_idx))),
+  sample(cen_idx, round(0.7 * length(cen_idx)))
+)
+test_idx  <- setdiff(seq_len(nrow(rf_data)), train_idx)
+
+train_data <- rf_data[train_idx, ]
+test_data  <- rf_data[test_idx, ]
+```
+
+# Train Random Forest
+
+```{r}
+rf_model <- randomForest(
+  survival_time ~ .,
+  data  = train_data %>% select(-event),
+  ntree = 100,
+  importance = TRUE
+)
+
+# get median risk threshold from training set
+train_data$pred_train       <- predict(rf_model, newdata = train_data)
+rf_median_score             <- median(train_data$pred_train, na.rm = TRUE)
+
+# apply to test set
+test_data$predicted <- predict(rf_model, newdata = test_data)
+
+```
+
+# Evaluate Model
+
+```{r}
+# C-index
+c_index <- concordance(
+  Surv(test_data$survival_time, test_data$event) ~ test_data$predicted
+)$concordance
+
+# 1-year ROC/AUC
+test_data <- test_data %>%
+  mutate(
+    surv_1yr = ifelse(survival_time <= 1 & event == 1, 1, 0),
+    valid    = survival_time >= 1 | (survival_time < 1 & event == 1)
+  )
+
+labels    <- test_data$surv_1yr[test_data$valid]
+scores    <- test_data$predicted[test_data$valid]
+valid_idx <- complete.cases(labels, scores)
+
+roc_obj <- roc(labels[valid_idx], scores[valid_idx], direction = "<")
+auc_val <- as.numeric(auc(roc_obj))
+```
+
+# Output Table and Plot
+
+```{r}
+metrics <- data.frame(
+  Metric = c("C-index", "AUC (1-Year)"),
+  Value  = c(round(c_index, 3), round(auc_val, 3))
+)
+knitr::kable(metrics, caption = "Random Forest Performance")
+
+print(
+  ggroc(roc_obj) +
+    geom_abline(linetype = "dashed") +
+    labs(
+      title    = "ROC (1-Year Mortality)",
+      subtitle = paste("AUC =", round(auc_val, 3))
+    ) +
+    theme_minimal()
+)
+```
+
+```{r}
+save(rf_model, rf_median_score, file = "rf.RData")
+```

@@ -1,0 +1,378 @@
+---
+title: "cox model"
+format: html
+editor: visual
+---
+
+## Cox Proportional Hazards Model
+
+```{r warning=FALSE, message=FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(limma)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(sva)
+library(reshape2)
+```
+
+```{r}
+load("SKCM.rda") # Ensure this contains query2
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+log_expr <- log2(fpkm + 1)
+
+# Extract batch (Plate ID) from TCGA barcodes
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) {
+  if (length(x) >= 6) x[6] else NA
+})
+if (any(is.na(batch))) warning("Some barcodes missing Plate ID")
+
+# Filter genes with zero variance
+gene_var <- apply(log_expr, 1, var)
+log_expr_filtered <- log_expr[gene_var > 0, ]
+```
+
+```{r}
+expr_long_before <- melt(log_expr_filtered, varnames = c("Gene", "Sample"), value.name = "Expression")
+expr_long_before$Batch <- batch[match(expr_long_before$Sample, colnames(log_expr_filtered))]
+
+#ggplot(expr_long_before, aes(x = Batch, y = Expression, fill = Batch)) +
+#  geom_boxplot(outlier.color = "red", alpha = 0.6) +
+#  theme_minimal() +
+#  labs(title = "Expression Distribution by Batch (Before Correction)", x = "Batch", y = "log2(FPKM + 1)") +
+#  theme(legend.position = "none")
+```
+
+### Visualizing survival by expression
+
+```{r}
+modcombat <- model.matrix(~1, data = data.frame(batch = batch))
+combat_expr <- ComBat(dat = as.matrix(log_expr_filtered), batch = batch, mod = modcombat, par.prior = TRUE, prior.plots = FALSE)
+```
+
+```{r}
+
+# Distribution After Batch Correction
+expr_long_after <- melt(combat_expr, varnames = c("Gene", "Sample"), value.name = "Expression")
+expr_long_after$Batch <- batch[match(expr_long_after$Sample, colnames(combat_expr))]
+
+#ggplot(expr_long_after, aes(x = Batch, y = #xpression, fill = Batch)) +
+#  geom_boxplot(outlier.color = "red", alpha = 0.6) +
+#  theme_minimal() +
+#  labs(title = "Expression Distribution by Batch (After Correction)", x = "Batch", y = "log2(FPKM + 1)") +
+#  theme(legend.position = "none")
+```
+
+```{r}
+library(dplyr)
+gene_info <- as.data.frame(rowData(query2))
+target_genes <- c("BRAF", "NRAS", "TP53", "KIT", "CDKN2A", "PTEN")
+melanoma_genes <- gene_info %>%
+  filter(gene_name %in% target_genes) %>%
+  pull(gene_id)
+print(melanoma_genes)
+```
+
+```{r}
+melanoma_genes %in% row.names(combat_expr)
+```
+
+```{r}
+missing_genes <- melanoma_genes[!melanoma_genes %in% row.names(combat_expr)]
+print(missing_genes)
+```
+
+```{r}
+head(rowData(query2)$gene_name)
+```
+
+```{r}
+# Cox Proportional Hazards Model
+library(dplyr)
+
+# Prepare survival data
+surv_data <- colData(query2) %>%
+  as.data.frame() %>%
+  mutate(
+    time = as.numeric(paper_CURATED_DAYS_TO_DEATH_OR_LAST_FU), # Convert to numeric
+    status = ifelse(vital_status == "Dead", 1, 0) # 1 = event (death), 0 = censored (Alive)
+  ) %>%
+  filter(!is.na(time), time > 0, !is.na(status)) # Remove invalid entries
+
+# Check sample size and survival data
+cat("Number of samples with valid survival data:", nrow(surv_data), "\n")
+cat("Number of events (deaths):", sum(surv_data$status), "\n")
+cat("Summary of survival times:\n")
+summary(surv_data$time)
+
+# Subset expression data to match survival samples
+combat_expr_t <- t(combat_expr) # Transpose: samples as rows, genes as columns
+surv_samples <- intersect(rownames(combat_expr_t), surv_data$barcode)
+surv_data <- surv_data[surv_data$barcode %in% surv_samples, ]
+combat_expr_t <- combat_expr_t[surv_samples, ]
+
+# Map gene symbols to ENSG IDs
+gene_info <- as.data.frame(rowData(query2))
+target_genes <- c("BRAF", "NRAS", "TP53", "KIT", "CDKN2A", "PTEN")
+melanoma_genes <- gene_info %>%
+  filter(gene_name %in% target_genes) %>%
+  pull(gene_id)
+
+# Check if genes exist in expression data
+available_genes <- melanoma_genes[melanoma_genes %in% colnames(combat_expr_t)]
+if (length(available_genes) == 0) {
+  warning("None of the specified genes found in expression data. Using top 5 variable genes instead.")
+  gene_vars <- apply(combat_expr, 1, var)
+  available_genes <- names(sort(gene_vars, decreasing = TRUE))[1:5]
+} else if (length(available_genes) < length(melanoma_genes)) {
+  warning("Some genes not found: ", paste(setdiff(melanoma_genes, available_genes), collapse = ", "))
+}
+
+# Use only available genes
+melanoma_genes <- available_genes
+cox_data <- data.frame(
+  time = surv_data$time,
+  status = surv_data$status,
+  combat_expr_t[, melanoma_genes, drop = FALSE]
+)
+
+# Fit Cox model for each gene
+cox_results <- lapply(melanoma_genes, function(gene) {
+  formula <- as.formula(paste("Surv(time, status) ~", gene))
+  cox_model <- coxph(formula, data = cox_data)
+  summary(cox_model)$coefficients[1, ] # Extract gene coefficient
+})
+
+# Combine results into a data frame
+cox_summary <- do.call(rbind, cox_results)
+cox_summary <- as.data.frame(cox_summary) %>%
+  mutate(
+    Gene = melanoma_genes,
+    Gene_Name = gene_info$gene_name[match(melanoma_genes, gene_info$gene_id)], # Add gene symbols
+    HR = exp(coef), # Hazard ratio
+    p_value = `Pr(>|z|)`,
+    FDR = p.adjust(p_value, method = "fdr") # Adjust for multiple testing
+  ) %>%
+  arrange(p_value) # Sort by unadjusted p-value
+
+# Display results
+print("Cox model results:")
+cox_summary[, c("Gene_Name", "Gene", "HR", "p_value", "FDR")]
+```
+
+```{r}
+library(dplyr)
+library(survival)
+
+# Prepare survival data
+surv_data <- colData(query2) %>%
+  as.data.frame() %>%
+  mutate(
+    time = as.numeric(paper_CURATED_DAYS_TO_DEATH_OR_LAST_FU), # Main time column
+    # Alternative: Uncomment to try different time column
+    # time = as.numeric(paper_CURATED_TCGA_DAYS_TO_DEATH_OR_LAST_FU),
+    status = ifelse(vital_status == "Dead", 1, 0), # 1 = event (death), 0 = censored (Alive)
+    # Optional covariates
+    # age = as.numeric(age_at_diagnosis),
+    # stage = as.character(ajcc_pathologic_stage),
+    # stage = case_when(
+    #   grepl("Stage I|Stage II", stage) ~ "Early Stage",
+    #   grepl("Stage III|Stage IV", stage) ~ "Advanced Stage",
+    #   TRUE ~ NA_character_
+    # )
+  ) %>%
+  filter(!is.na(time), time > 0, !is.na(status)) # Minimal filtering
+  # Optional: Uncomment to include covariates
+  # filter(!is.na(time), time > 0, !is.na(status), !is.na(age), !is.na(stage))
+
+# Check sample size and survival data
+cat("Number of samples with valid survival data:", nrow(surv_data), "\n")
+cat("Number of events (deaths):", sum(surv_data$status), "\n")
+cat("Summary of survival times:\n")
+summary(surv_data$time)
+
+# Subset expression data to match survival samples
+combat_expr_t <- t(combat_expr) # Transpose: samples as rows, genes as columns
+surv_samples <- intersect(rownames(combat_expr_t), surv_data$barcode)
+surv_data <- surv_data[surv_data$barcode %in% surv_samples, ]
+combat_expr_t <- combat_expr_t[surv_samples, ]
+
+# Map gene symbols to ENSG IDs
+gene_info <- as.data.frame(rowData(query2))
+target_genes <- c("BRAF", "NRAS", "TP53", "KIT", "CDKN2A", "PTEN")
+melanoma_genes <- gene_info %>%
+  filter(gene_name %in% target_genes) %>%
+  pull(gene_id)
+
+# Option: Add top 10 variable genes for exploration
+# gene_vars <- apply(combat_expr, 1, var)
+# top_var_genes <- names(sort(gene_vars, decreasing = TRUE))[1:10]
+# melanoma_genes <- unique(c(melanoma_genes, top_var_genes))
+
+# Check if genes exist in expression data
+available_genes <- melanoma_genes[melanoma_genes %in% colnames(combat_expr_t)]
+if (length(available_genes) == 0) {
+  warning("None of the specified genes found in expression data. Using top 5 variable genes instead.")
+  gene_vars <- apply(combat_expr, 1, var)
+  available_genes <- names(sort(gene_vars, decreasing = TRUE))[1:5]
+} else if (length(available_genes) < length(melanoma_genes)) {
+  warning("Some genes not found: ", paste(setdiff(melanoma_genes, available_genes), collapse = ", "))
+}
+
+# Use only available genes
+melanoma_genes <- available_genes
+cox_data <- data.frame(
+  time = surv_data$time,
+  status = surv_data$status,
+  combat_expr_t[, melanoma_genes, drop = FALSE]
+)
+
+# Fit Cox model for each gene (minimal model)
+cox_results <- lapply(melanoma_genes, function(gene) {
+  formula <- as.formula(paste("Surv(time, status) ~", gene))
+  # Optional: Uncomment to include covariates
+  # formula <- as.formula(paste("Surv(time, status) ~", gene, "+ age + stage"))
+  cox_model <- coxph(formula, data = cox_data)
+  # Check proportional hazards assumption
+  ph_test <- cox.zph(cox_model)
+  cat("Proportional hazards test for", gene, ":", ph_test$table["GLOBAL", "p"], "\n")
+  summary(cox_model)$coefficients[1, ] # Extract gene coefficient
+})
+
+# Combine results into a data frame
+cox_summary <- do.call(rbind, cox_results)
+cox_summary <- as.data.frame(cox_summary) %>%
+  mutate(
+    Gene = melanoma_genes,
+    Gene_Name = gene_info$gene_name[match(melanoma_genes, gene_info$gene_id)],
+    HR = exp(coef), # Hazard ratio
+    p_value = `Pr(>|z|)`,
+    FDR = p.adjust(p_value, method = "fdr") # Adjust for multiple testing
+  ) %>%
+  arrange(p_value) # Sort by unadjusted p-value
+
+# Display results
+print("Cox model results (minimal model):")
+cox_summary[, c("Gene_Name", "Gene", "HR", "p_value", "FDR")]
+```
+
+```{r}
+library(ggplot2)
+
+# Plot hazard ratios for genes with unadjusted p < 0.2 (lenient threshold)
+sig_genes <- cox_summary %>% filter(p_value < 0.2)
+if (nrow(sig_genes) > 0) {
+  ggplot(sig_genes, aes(x = reorder(Gene_Name, HR), y = HR)) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = exp(coef - 1.96 * `se(coef)`), ymax = exp(coef + 1.96 * `se(coef)`)), width = 0.2) +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Hazard Ratios for Genes (p < 0.2)", x = "Gene", y = "Hazard Ratio (95% CI)") +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "red")
+} else {
+  print("No genes with unadjusted p < 0.2")
+}
+```
+
+```{r}
+# Cox Survival Model
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+
+# Prepare clinical data
+clinical <- colData(query2) %>%
+  as.data.frame() %>%
+  mutate(
+    survival_time = as.numeric(paper_CURATED_DAYS_TO_DEATH_OR_LAST_FU) / 365, # Convert to years
+    event = ifelse(vital_status == "Dead", 1, 0), # 1 = death, 0 = censored
+    age_diagnosis = as.numeric(age_at_diagnosis) / 365, # Convert to years
+    gender = as.factor(gender)
+  ) %>%
+  filter(!is.na(survival_time), survival_time > 0, !is.na(event)) # Minimal filtering
+
+# Check sample size and events
+cat("Number of samples with valid survival data:", nrow(clinical), "\n")
+cat("Number of events (deaths):", sum(clinical$event), "\n")
+cat("Summary of survival times (years):\n")
+summary(clinical$survival_time)
+
+# Subset batch-corrected expression data to match clinical samples
+combat_expr_t <- t(combat_expr) # Transpose: samples as rows, genes as columns
+surv_samples <- intersect(rownames(combat_expr_t), clinical$barcode)
+clinical <- clinical[clinical$barcode %in% surv_samples, ]
+combat_expr_t <- combat_expr_t[surv_samples, ]
+
+# Map melanoma genes to ENSG IDs
+gene_info <- as.data.frame(rowData(query2))
+target_genes <- c("BRAF", "NRAS", "TP53", "KIT", "CDKN2A", "PTEN")
+melanoma_genes <- gene_info %>%
+  filter(gene_name %in% target_genes) %>%
+  pull(gene_id)
+
+# Check if genes exist in expression data
+available_genes <- melanoma_genes[melanoma_genes %in% colnames(combat_expr_t)]
+if (length(available_genes) == 0) {
+  warning("None of the specified genes found in expression data. Using top 5 variable genes instead.")
+  gene_vars <- apply(combat_expr, 1, var)
+  available_genes <- names(sort(gene_vars, decreasing = TRUE))[1:5]
+} else if (length(available_genes) < length(melanoma_genes)) {
+  warning("Some genes not found: ", paste(setdiff(melanoma_genes, available_genes), collapse = ", "))
+}
+
+# Use only available genes
+melanoma_genes <- available_genes
+
+# Create cox_data with clinical and gene expression
+cox_data <- data.frame(
+  survival_time = clinical$survival_time,
+  event = clinical$event,
+  age_diagnosis = clinical$age_diagnosis,
+  gender = clinical$gender,
+  combat_expr_t[, melanoma_genes, drop = FALSE]
+)
+
+# Fit Cox model for each gene individually (univariate)
+cox_results <- lapply(melanoma_genes, function(gene) {
+  formula <- as.formula(paste("Surv(survival_time, event) ~", gene))
+  cox_model <- coxph(formula, data = cox_data)
+  # Check proportional hazards assumption
+  ph_test <- cox.zph(cox_model)
+  cat("Proportional hazards test for", gene_info$gene_name[gene_info$gene_id == gene], 
+      ":", ph_test$table["GLOBAL", "p"], "\n")
+  summary(cox_model)$coefficients[1, ]
+})
+
+# Combine univariate results
+cox_summary <- do.call(rbind, cox_results)
+cox_summary <- as.data.frame(cox_summary) %>%
+  mutate(
+    Gene = melanoma_genes,
+    Gene_Name = gene_info$gene_name[match(melanoma_genes, gene_info$gene_id)],
+    HR = exp(coef), # Hazard ratio
+    p_value = `Pr(>|z|)`,
+    FDR = p.adjust(p_value, method = "fdr") # Adjust for multiple testing
+  ) %>%
+  arrange(p_value)
+
+# Display univariate results
+print("Univariate Cox model results:")
+cox_summary[, c("Gene_Name", "Gene", "HR", "p_value", "FDR")]
+
+# Fit multivariate Cox model with all genes and clinical covariates
+formula_multivariate <- as.formula(
+  paste("Surv(survival_time, event) ~", 
+        paste(melanoma_genes, collapse = " + "), "+ age_diagnosis + gender")
+)
+cox_model_multivariate <- coxph(formula_multivariate, data = cox_data)
+cox_summary_multivariate <- summary(cox_model_multivariate)
+
+# Check proportional hazards for multivariate model
+ph_test_multivariate <- cox.zph(cox_model_multivariate)
+cat("Proportional hazards test for multivariate model (GLOBAL p-value):", 
+    ph_test_multivariate$table["GLOBAL", "p"], "\n")
+```

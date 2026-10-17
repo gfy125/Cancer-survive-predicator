@@ -1,0 +1,196 @@
+---
+title: "SVM"
+format: html
+editor: visual
+---
+
+# Load Libraries and Data
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(limma)
+library(survival)
+library(e1071)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(tibble)
+library(tidyverse)
+```
+
+# Preparing
+
+```{r}
+# Load SKCM expression object
+load("SKCM.rda")
+
+# Extract clinical data
+clinical <- colData(query2) %>%
+  as.data.frame() %>%
+  select(patient, gender, vital_status, days_to_death, 
+         ajcc_pathologic_stage, age_at_diagnosis) %>%
+  mutate(
+    survival_time = days_to_death / 365,
+    event = ifelse(vital_status == "Dead", 1, 0),
+    age_diagnosis = age_at_diagnosis / 365
+  ) %>%
+  filter(!is.na(survival_time) & !is.na(event))
+
+# Log2 transform expression data
+log_expr <- log2(assay(query2, "fpkm_uq_unstrand") + 1)
+
+# Match samples between clinical and expression
+matched_samples <- intersect(rownames(clinical), colnames(log_expr))
+clinical <- clinical[matched_samples, ]
+log_expr <- log_expr[, matched_samples]
+```
+
+# Feature Selection
+
+```{r}
+# Select top 1000 most variable genes
+select_top_var_genes <- function(expr, n = 1000) {
+  top_genes <- names(sort(apply(expr, 1, var), decreasing = TRUE))[1:n]
+  return(top_genes)
+}
+
+# Select top 50 genes associated with survival using Cox p-values
+select_surv_genes <- function(expr, time, event, n = 50) {
+  pvals <- sapply(1:nrow(expr), function(i) {
+    fit <- tryCatch(coxph(Surv(time, event) ~ expr[i,]), error = function(e) NULL)
+    if (!is.null(fit)) summary(fit)$coefficients[1, 5] else 1
+  })
+  names(pvals) <- rownames(expr)
+  top_genes <- names(sort(pvals))[1:n]
+  return(top_genes)
+}
+
+top_genes <- select_top_var_genes(log_expr, 1000)
+log_expr_sub <- log_expr[top_genes, ]
+surv_genes <- select_surv_genes(log_expr_sub, clinical$survival_time, clinical$event, 50)
+expr_final <- t(log_expr[surv_genes, ])
+
+# Combine expression and clinical data
+svm_data <- as.data.frame(expr_final) %>%
+  mutate(
+    survival_time = clinical$survival_time,
+    event = clinical$event,
+    gender = factor(clinical$gender),
+    age_diagnosis = clinical$age_diagnosis,
+    stage = factor(case_when(
+      grepl("I", clinical$ajcc_pathologic_stage) ~ "Early",
+      grepl("II", clinical$ajcc_pathologic_stage) ~ "Intermediate",
+      grepl("III|IV", clinical$ajcc_pathologic_stage) ~ "Advanced",
+      TRUE ~ NA_character_
+    ))
+  )
+```
+
+# Remove NA
+
+```{r}
+nzv <- nearZeroVar(svm_data %>% select(-survival_time, -event), names = TRUE)
+svm_data <- svm_data[, setdiff(colnames(svm_data), nzv)]
+```
+
+# Split data
+
+```{r}
+set.seed(42)
+idx_event <- which(svm_data$event == 1)
+idx_censored <- which(svm_data$event == 0)
+
+train_idx <- c(
+  sample(idx_event, size = round(0.7 * length(idx_event))),
+  sample(idx_censored, size = round(0.7 * length(idx_censored)))
+)
+test_idx <- setdiff(seq_len(nrow(svm_data)), train_idx)
+
+train_data <- svm_data[train_idx, ]
+train_data <- na.omit(train_data)
+test_data <- svm_data[test_idx, ]
+test_data <- na.omit(test_data)
+```
+
+# Train SVM Model
+
+```{r}
+predictors <- setdiff(colnames(train_data), c("survival_time", "event"))
+form <- as.formula(paste("survival_time ~", paste(predictors, collapse = " + ")))
+
+set.seed(42)
+svm_model <- train(
+  form,
+  data = train_data,
+  method = "svmRadial",
+  preProcess = c("center", "scale"),
+  trControl = trainControl(method = "cv", number = 5),
+  tuneLength = 5
+)
+
+test_data$predicted <- predict(svm_model, newdata = test_data)
+```
+
+# Evaluate Model
+
+```{r}
+# C-index (survival concordance)
+c_index <- concordance(Surv(test_data$survival_time, test_data$event) ~ test_data$predicted)$concordance
+
+# AUC for 1-year mortality
+test_data$surv_1yr <- with(test_data, ifelse(survival_time <= 1 & event == 1, 1, 0))
+valid <- with(test_data, survival_time >= 1 | (survival_time < 1 & event == 1))
+labels <- test_data$surv_1yr[valid]
+scores <- test_data$predicted[valid]
+valid_idx <- complete.cases(labels, scores)
+
+roc_plot <- if (sum(valid_idx) > 10) {
+  roc_obj <- pROC::roc(labels[valid_idx], scores[valid_idx], direction = "<")
+  auc_val <- as.numeric(pROC::auc(roc_obj))
+  ggroc(roc_obj) + geom_abline(linetype = "dashed") +
+    labs(title = "1-Year Mortality ROC (SVM)", subtitle = paste("AUC =", round(auc_val, 3))) +
+    theme_minimal()
+} else {
+  ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Not enough samples for ROC") + theme_void()
+}
+```
+
+# Visualizations
+
+```{r}
+# Predicted vs Actual
+scatter_plot <- ggplot(test_data, aes(x = survival_time, y = predicted)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Predicted vs Actual Survival Time", x = "Actual", y = "Predicted")
+
+# Variable importance
+varimp_plot <- tryCatch({
+  vip <- varImp(svm_model)
+  ggplot(vip$importance %>% head(20) %>% rownames_to_column("Feature"),
+         aes(x = reorder(Feature, Overall), y = Overall)) +
+    geom_col(fill = "steelblue") + coord_flip() + theme_minimal() +
+    labs(title = "Top 20 Important Features (SVM)", x = "Feature", y = "Importance")
+}, error = function(e) ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No varImp available") + theme_void())
+```
+
+# Table
+
+```{r}
+metrics <- data.frame(
+  Metric = c("C-index", "AUC (1yr)"),
+  Value = c(round(c_index, 3), if (exists("auc_val")) round(auc_val, 3) else NA)
+)
+knitr::kable(metrics, caption = "SVM Model Performance")
+```
+
+# Display plots
+
+```{r}
+print(scatter_plot)
+print(roc_plot)
+print(varimp_plot)
+```

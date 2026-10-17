@@ -1,0 +1,198 @@
+---
+title: "LASSO Cox"
+format: html
+editor: visual
+---
+
+# Load Libraries
+
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(survival)
+library(survminer)
+library(glmnet)
+library(pROC)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(pec)
+
+load("SKCM.rda")
+```
+
+# Prepare Data
+
+```{r}
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(bcr_patient_barcode, gender, vital_status, days_to_death, age_at_diagnosis, ajcc_pathologic_stage) %>%
+  mutate(
+    survival_time = ifelse(!is.na(days_to_death), days_to_death / 365, age_at_diagnosis / 365),
+    event = ifelse(vital_status == "Dead", 1, 0),
+    age_diagnosis = age_at_diagnosis / 365
+  ) %>%
+  filter(!is.na(survival_time) & survival_time > 0)
+
+log_expr <- log2(assay(query2, "fpkm_uq_unstrand") + 1)
+
+matched_samples <- intersect(rownames(clinical), colnames(log_expr))
+clinical <- clinical[matched_samples, ]
+log_expr <- log_expr[, matched_samples]
+```
+
+# Feature Selection
+
+```{r}
+# select top 1000
+top1k <- names(sort(apply(log_expr,1,var),
+                    decreasing=TRUE))[1:1000]
+expr_filt <- log_expr[top1k, ]
+
+expr_mat  <- t(expr_filt)
+
+surv_data <- as.data.frame(expr_mat) %>%
+  mutate(
+    survival_time = clinical$survival_time,
+    event         = clinical$event
+  )
+```
+
+# Train/Test Split
+
+```{r}
+set.seed(42)
+evt_idx  <- which(surv_data$event==1)
+cen_idx  <- which(surv_data$event==0)
+train_idx <- c(
+  sample(evt_idx,  round(0.7*length(evt_idx))),
+  sample(cen_idx,  round(0.7*length(cen_idx)))
+)
+test_idx  <- setdiff(seq_len(nrow(surv_data)), train_idx)
+
+train_data <- surv_data[train_idx, ]
+test_data  <- surv_data[test_idx, ]
+```
+
+# LASSO Cox Model with glmnet
+
+```{r}
+# prepare matrices
+x_train <- as.matrix(train_data %>% select(-survival_time, -event))
+y_train <- Surv(train_data$survival_time, train_data$event)
+
+# cross-validated LASSO Cox
+cvfit     <- cv.glmnet(x_train, y_train, family="cox", alpha=1)
+lasso_mod <- glmnet(x_train, y_train,
+                    family="cox", alpha=1,
+                    lambda=cvfit$lambda.min)
+```
+
+# Predict and Evaluate
+
+```{r}
+# risk scores on test set
+x_test <- as.matrix(test_data %>% select(-survival_time, -event))
+test_data$risk_score <- as.numeric(
+  predict(lasso_mod, newx=x_test, type="link")
+)
+# dichotomize by median
+med_score <- median(test_data$risk_score, na.rm=TRUE)
+test_data$risk_group <- factor(
+  ifelse(test_data$risk_score>med_score,
+         "High","Low"),
+  levels=c("Low","High")
+)
+
+# concordance index
+cindex <- concordance(
+  Surv(test_data$survival_time, test_data$event)
+  ~ test_data$risk_score
+)$concordance
+
+# 1-year ROC/AUC
+test_data <- test_data %>%
+  mutate(
+    surv_1yr = ifelse(survival_time<=1 & event==1, 1, 0),
+    valid    = survival_time>=1 |
+               (survival_time<1 & event==1)
+  )
+
+roc_obj <- roc(test_data$surv_1yr[test_data$valid], test_data$risk_score[test_data$valid])
+auc <- as.numeric(auc(roc_obj))
+```
+
+# Visualizations
+
+```{r}
+# Risk score density
+ggplot(test_data, aes(x=risk_score, fill=factor(event))) +
+  geom_density(alpha=0.6) + theme_minimal() +
+  labs(title="LASSO Cox Risk Score Distribution",
+       x="Risk Score", fill="Event")
+
+# KM curve
+km_fit <- survfit(Surv(survival_time,event)~risk_group,
+                  data=test_data)
+print(
+  ggsurvplot(km_fit, data=test_data,
+             pval=TRUE, risk.table=TRUE,
+             title="KM by LASSO Risk Group")
+)
+
+# ROC curve
+if(!is.na(auc)){
+  print(
+    ggroc(roc_obj) +
+      geom_abline(linetype="dashed") +
+      theme_minimal() +
+      labs(title="ROC (1-Year Mortality)",
+           subtitle=paste("AUC =",round(auc,3)))
+  )
+} else {
+  print(
+    ggplot() +
+      annotate("text", x=0.5, y=0.5,
+               label="Insufficient data for ROC") +
+      theme_void()
+  )
+}
+```
+
+# Metrics Summary
+
+```{r}
+calib_fit <- coxph(
+  Surv(survival_time, event) ~ offset(risk_score) + I(risk_score),
+  data = test_data
+)
+cal_slope <- coef(calib_fit)["I(risk_score)"]
+
+
+metrics <- data.frame(
+  Metric = c(
+    "C-index",
+    "AUC (1-Year Mortality)",
+    "Calibration Slope"
+  ),
+  Value = c(
+    round(cindex, 3),
+    round(auc,    3),
+    round(cal_slope,      3)
+  )
+)
+
+knitr::kable(metrics, caption = "Lasso Cox Model Evaluation Metrics")
+```
+```{r}
+# Calculate number of selected genes (non-zero coefficients)
+coef_lasso <- coef(lasso_mod)
+
+
+num_selected_genes <- sum(coef_lasso != 0) - 1  
+cat("Number of Selected Genes:", num_selected_genes, "\n")
+```
+```{r}
+save(lasso_mod, clinical, expr_filt, file = "lasso.RData")
+```

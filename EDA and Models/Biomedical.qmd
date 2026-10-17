@@ -1,0 +1,17 @@
+---
+title: "Biomedical"
+format: html
+editor: visual
+---
+```{r}
+citation("curatedTCGAData")
+```
+
+```{r}
+library(TCGAbiolinks)
+```
+
+```{r}
+clinical_data <- GDCquery_clinic(project = "TCGA-SKCM", type = "clinical")
+bio_data <- GDCquery_clinic(project = 'TCGA-SKCM', type = 'Biospecimen')
+```

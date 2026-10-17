@@ -1,0 +1,254 @@
+---
+title: "Cox Prediction"
+format:
+  html:
+    code-tools: true
+    code-fold: true
+    fig_caption: yes
+    number_sections: yes
+    embed-resources: true
+    theme: flatly
+    css: 
+      - https://use.fontawesome.com/releases/v5.0.6/css/all.css
+    toc: true
+    toc_depth: 4
+    toc_float: true
+execute:
+  echo: true
+  tidy: true
+---
+
+# Loading Libraries and Data
+
+```{r warning=FALSE, message=FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(limma)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(sva)
+library(reshape2)
+library(caret)
+library(glmnet)
+
+data <- load("SKCM.rda")
+
+# Extract clinical data
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(gender, vital_status, days_to_death, 
+               ajcc_pathologic_stage, age_at_diagnosis)
+
+# Create proper survival object
+clinical <- clinical %>%
+  mutate(
+    # Calculate survival time in years
+    survival_time = ifelse(vital_status == "Alive", NA, days_to_death / 365),
+    event = ifelse(vital_status == "Dead", 1, 0),
+    
+    # Convert age to years
+    age_diagnosis = age_at_diagnosis / 365
+  ) %>%
+  # Handle missing values
+  mutate(
+    age_diagnosis = ifelse(is.na(age_diagnosis), median(age_diagnosis, na.rm = TRUE), age_diagnosis),
+    # ajcc_pathologic_stage = ifelse(is.na(ajcc_pathologic_stage), "Unknown", ajcc_pathologic_stage)
+  )
+
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+
+log_expr <- log2(fpkm + 1)
+```
+
+
+```{r}
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) {
+  if (length(x) >= 6) return(x[6]) else return(NA)
+})
+
+
+gene_var <- apply(log_expr, 1, var)
+log_expr_filtered <- log_expr[gene_var > 0, ]
+```
+
+# Batch Correction
+
+```{r message=FALSE}
+# ComBat 
+modcombat <- model.matrix(~1, data = data.frame(batch = batch))
+combat_expr <- ComBat(dat = as.matrix(log_expr_filtered),
+                      batch = batch,
+                      mod = modcombat,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+```
+
+# Cox Survival Model
+
+```{r}
+# Filter to ensure the samples match between clinical and gene expression data
+combat_expr_filtered <- combat_expr[, rownames(clinical)]
+
+# Convert relevant character variables to factors
+clinical$gender <- as.factor(clinical$gender)
+clinical$vital_status <- as.factor(clinical$vital_status)
+clinical$ajcc_pathologic_stage <- as.factor(clinical$ajcc_pathologic_stage)
+
+```
+
+```{r warning=FALSE}
+# Create a data frame with gene expression data
+gene_expr <- log_expr_filtered
+
+# Perform univariate Cox regression for each gene
+gene_pvals <- apply(gene_expr, 1, function(gene) {
+  # Create a data frame with survival and gene expression data
+  df <- data.frame(
+    time = clinical$survival_time,
+    status = clinical$event,
+    gene = gene
+  )
+  
+  # Fit the Cox model and extract the p-value for the gene
+  tryCatch({
+    coxph_res <- coxph(Surv(time, status) ~ gene, data = df)
+    summary(coxph_res)$coefficients["gene", "Pr(>|z|)"]
+  }, error = function(e) NA)  # Handle errors in case of failed fitting
+})
+
+# Sort genes by p-value (smallest p-value first)
+top_20_genes_pvalue <- names(sort(gene_pvals, na.last = NA))[1:10]
+
+# Filter gene expression data for these 20 genes
+gene_expr_filtered <- gene_expr[top_20_genes_pvalue, ]
+
+# Now, let's create a data frame with the relevant clinical data and batch-corrected expression
+cox_data <- cbind(clinical, t(gene_expr_filtered))
+
+cox_data <- cox_data %>%
+  select(-days_to_death, -age_at_diagnosis)
+
+```
+
+# Fit Cox Model
+
+```{r}
+# Fit Cox model with clinical and gene expression data
+cox_model_genes <- coxph(Surv(survival_time, event) ~ ., data = cox_data, na.action = "na.exclude")
+cox_summary <- summary(cox_model_genes)
+```
+
+## Relative Hazard Distribution
+
+```{r}
+all_lp <- predict(cox_model_genes, type = "lp")
+
+# Calculate relative hazard for each patient
+all_relative_hazard <- exp(all_lp)
+
+relative_hazard_df <- data.frame(relative_hazard = all_relative_hazard)
+relative_hazard_df$log_transformed <- log10(relative_hazard_df$relative_hazard)
+
+
+# Plot using ggplot
+ggplot(relative_hazard_df, aes(x = relative_hazard)) +
+  geom_histogram(binwidth = 0.2, fill = "lightblue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Relative Hazards (Training Patients)",
+       x = "Relative Hazard", 
+       y = "Frequency") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  ) 
+```
+
+
+```{r}
+# Survival curves
+surv_fit <- survfit(cox_model_genes)
+
+plot(surv_fit, 
+     main = "Survival Curve", 
+     xlab = "Time (Years)", 
+     ylab = "Survival Probability",
+     col = "blue",
+     lwd = 2,
+     xlim = c(0, 5))
+grid()
+```
+
+## Metrics
+
+| Concordance     |  Standard Error Concordance | AIC |
+|-----------------| -----------------|----------|
+| `r cox_summary$concordance[1]`             | `r cox_summary$concordance[2]` | `r AIC(cox_model_genes)` |
+-------------------
+
+- The Concordance value indicates a relatively strong agreement between the variables.
+- The Standard Error Concordance shows how much the estimate might vary.
+
+# Predicting a New Patient
+
+```{r}
+# Clinical variables
+new_patient <- data.frame(
+  gender = "female",
+  vital_status = "Alive",
+  age_diagnosis = 48.1,
+  ajcc_pathologic_stage = "Stage IIC"    
+)
+
+# Gene expression values from your example patient (TCGA-EE-A2GU)
+gene_values <- data.frame(
+ENSG00000253648.1 = 0.00000000,
+ENSG00000105427.10 = 2.37926052,
+ENSG00000235015.1 = 0.00000000,
+ENSG00000196344.11 = 0.000000000,
+ENSG00000124466.9 = 1.3307878,
+ENSG00000143556.9 = 0.00000000,
+ENSG00000170465.10 = 0.000000000,
+ENSG00000188373.5 = 0.00000000,
+ENSG00000186081.12 = 0.512479747,
+ENSG00000186832.9 = 0.033511102
+)
+
+new_patient <- cbind(new_patient, gene_values)
+
+new_patient$gender <- factor(new_patient$gender, levels = levels(clinical$gender))
+new_patient$ajcc_pathologic_stage <- factor(new_patient$ajcc_pathologic_stage, levels = levels(clinical$ajcc_pathologic_stage))
+
+
+# Predict linear risk score
+new_patient_lp <- predict(cox_model_genes, newdata = new_patient, type = "lp")
+relative_hazard <- exp(new_patient_lp)
+relative_hazard <- as.numeric(format(relative_hazard, scientific=FALSE))
+relative_hazard <- log10(relative_hazard)
+
+```
+
+| Linear Risk Score  | Relative Hazard     |
+|--------------------|---------------------|
+| `r new_patient_lp` | `r relative_hazard` |
+--------------------------------------------
+
+- Since the linear risk score is negative and fairly large, it suggests this individual has a lower risk of death compared to the baseline.
+- Since the relative hazard is they are at very low risk of death compared to the baseline
+
+```{r}
+# Predict survival probabilities
+surv_pred <- survfit(cox_model_genes, newdata = new_patient)
+plot(surv_pred, 
+     main = "Predicted Survival for New Patient", 
+     xlab = "Time (Years)", 
+     ylab = "Survival Probability",
+     col = "blue",
+     lwd = 2)
+grid()
+
+```
+

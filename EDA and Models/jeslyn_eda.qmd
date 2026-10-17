@@ -1,0 +1,82 @@
+---
+title: "Jeslyn_EDA"
+format: html
+editor: visual
+---
+
+# Data Loading
+
+```{r}
+citation("curatedTCGAData")
+```
+
+```{r}
+library(TCGAbiolinks)
+library(MultiAssayExperiment)
+library(S4Vectors)
+library(SummarizedExperiment)
+library(shiny)
+library(dplyr)
+```
+
+```{r}
+# Query and download gene expression data for TCGA-SKCM
+expression_query <- GDCquery(project = "TCGA-SKCM",
+                             data.category = "Transcriptome Profiling",
+                             data.type = "Gene Expression Quantification",
+                             workflow.type = "STAR - Counts")
+GDCdownload(expression_query)
+expression_data <- GDCprepare(expression_query)
+```
+
+```{r}
+query2 <- GDCprepare(expression_query, directory = 'GDCdata', summarizedExperiment = T)
+save(query2, file = 'SKCM.rda')
+```
+
+# Visualisation
+
+```{r}
+data <- load("/Users/jeslynbowman/Documents/Uni/2025, Year 3/Sem 5, 2025/DATA3888/Group Project/data3888_capstone/SKCM.rda")
+```
+
+```{r}
+counts <- assay(query2)                # Gene expression counts
+genes  <- rowData(query2)              # Gene info
+samples <- colData(query2)             # Clinical/sample metadata
+```
+
+
+```{r}
+# Define gene of interest
+gene <- "ENSG00000000003.15"
+
+# Extract the row for TSPAN6 (or any other gene you're interested in)
+gene_row <- rowData(query2)$gene_id == gene
+expr_gene <- assay(query2, "fpkm_uq_unstrand")[gene_row, ]
+
+# Check the expression for the gene (it should have 473 values for 473 samples)
+head(expr_gene)
+
+# Extract 'days_to_birth' and convert to years
+days_to_birth <- colData(query2)$days_to_birth
+years_to_birth <- -round(days_to_birth / 365.25)  # Convert to years and flip sign
+
+# Create a data frame with Expression and Age (years_to_birth)
+df <- data.frame(Expression = log2(expr_gene + 1), Age = years_to_birth)
+
+# Remove rows with NA values (if any)
+df <- na.omit(df)
+
+# Plot the data
+library(ggplot2)
+
+ggplot(df, aes(x = Age, y = Expression)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = paste("Expression of", gene, "vs Age"),
+       y = "log2(Expression + 1)", x = "Age") +
+  theme_minimal()
+
+```
+

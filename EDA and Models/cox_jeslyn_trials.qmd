@@ -1,0 +1,249 @@
+---
+title: "Cox Prediction"
+format:
+  html:
+    code-tools: true
+    code-fold: true
+    fig_caption: yes
+    number_sections: yes
+    embed-resources: true
+    theme: flatly
+    css: 
+      - https://use.fontawesome.com/releases/v5.0.6/css/all.css
+    toc: true
+    toc_depth: 4
+    toc_float: true
+execute:
+  echo: true
+  tidy: true
+---
+
+# Loading Libraries and Data
+
+```{r warning=FALSE, message=FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(limma)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(sva)
+library(reshape2)
+library(caret)
+library(glmnet)
+library(stringr)
+library(tibble)
+library(survcomp)
+
+data <- load("SKCM.rda")
+clinical_followup <- read.csv("clinical_followup.csv")
+
+# Extract clinical data
+clinical <- colData(query2) %>% 
+  as.data.frame() %>%
+  dplyr::select(gender, vital_status, days_to_death, 
+               ajcc_pathologic_stage, age_at_diagnosis)
+
+# Create proper survival object
+clinical <- clinical %>%
+  mutate(
+    # Calculate survival time in years
+    survival_time = ifelse(vital_status == "Alive", NA, days_to_death / 365),
+    event = ifelse(vital_status == "Dead", 1, 0),
+    
+    # Convert age to years
+    age_diagnosis = age_at_diagnosis / 365
+  ) %>%
+  # Handle missing values
+  mutate(
+    age_diagnosis = ifelse(is.na(age_diagnosis), median(age_diagnosis, na.rm = TRUE), age_diagnosis),
+    ajcc_pathologic_stage = ifelse(is.na(ajcc_pathologic_stage), "Unknown", ajcc_pathologic_stage)
+  )
+
+clinical <- clinical %>%
+  mutate(patient_barcode = str_sub(rownames(clinical), 1, 12)) %>%
+  mutate(full_barcode = rownames(clinical))
+
+# First, select the most recent follow-up entry for each patient
+followup_latest <- clinical_followup %>%
+  group_by(bcr_patient_barcode) %>%
+  filter(!is.na(days_to_last_followup)) %>%
+  slice_max(order_by = days_to_last_followup, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(bcr_patient_barcode, days_to_last_followup)
+
+clinical<- clinical %>%
+  left_join(followup_latest, by = c("patient_barcode" = "bcr_patient_barcode"))
+
+clinical <- clinical %>%
+  column_to_rownames("full_barcode")
+
+clinical <- clinical %>%
+  mutate(
+    days_to_death = ifelse(vital_status == "Alive", days_to_last_followup, days_to_death),
+    survival_time = ifelse(vital_status == "Alive", days_to_last_followup / 365, survival_time)
+  )
+
+clinical <- clinical%>%
+  select(-patient_barcode, -days_to_last_followup, -age_at_diagnosis)
+
+clinical <- clinical %>%
+  filter(!is.na(survival_time))
+
+clinical <- clinical %>%
+  filter(survival_time > 0)
+
+fpkm <- assay(query2, "fpkm_uq_unstrand")
+
+log_expr <- log2(fpkm + 1)
+```
+
+
+```{r}
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) {
+  if (length(x) >= 6) return(x[6]) else return(NA)
+})
+
+
+gene_var <- apply(log_expr, 1, var)
+log_expr_filtered <- log_expr[gene_var > 0, ]
+```
+
+# Batch Correction
+
+```{r message=FALSE}
+# ComBat 
+modcombat <- model.matrix(~1, data = data.frame(batch = batch))
+combat_expr <- ComBat(dat = as.matrix(log_expr_filtered),
+                      batch = batch,
+                      mod = modcombat,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+```
+
+# Cox Survival Model
+
+```{r}
+# # Filter to ensure the samples match between clinical and gene expression data
+# combat_expr_filtered <- combat_expr[, rownames(clinical)]
+
+# Convert relevant character variables to factors
+clinical$gender <- as.factor(clinical$gender)
+clinical$vital_status <- as.factor(clinical$vital_status)
+clinical$ajcc_pathologic_stage <- as.factor(clinical$ajcc_pathologic_stage)
+
+```
+
+```{r}
+gene_expr <- log_expr_filtered
+
+# Prepare the expression matrix and survival data
+common_samples <- intersect(rownames(clinical), colnames(gene_expr))
+
+# Subset both datasets to those common samples
+X <- t(gene_expr[, common_samples])  # transpose after subsetting
+
+# Remove genes with near-zero variance (optional but helps)
+X <- X[, apply(X, 2, sd, na.rm = TRUE) > 1e-5]
+
+# 2. Create the survival object
+y <- Surv(clinical$survival_time, clinical$event)
+
+# Fit LASSO Cox model using cross-validation to choose lambda
+set.seed(123)  # for reproducibility
+cv_fit <- cv.glmnet(X, y, family = "cox", alpha = 1)
+
+# Extract coefficients at the best lambda
+lasso_coef <- coef(cv_fit, s = "lambda.min")
+selected_genes <- rownames(lasso_coef)[as.vector(lasso_coef) != 0]
+
+# Subset gene expression matrix by selected genes
+selected_expr <- gene_expr[selected_genes, , drop = FALSE]  # genes x patients
+
+# Transpose to get patients x genes (for merging)
+selected_expr_t <- t(selected_expr)
+
+# Ensure rownames match clinical data
+# (both should have patient barcodes as rownames)
+common_patients <- intersect(rownames(clinical), rownames(selected_expr_t))
+
+# Subset both datasets to the common patients
+clinical_subset <- clinical[common_patients, , drop = FALSE]
+expr_subset <- selected_expr_t[common_patients, , drop = FALSE]
+
+# Combine into one data frame
+cox_data <- cbind(clinical_subset, expr_subset)
+
+cox_data <- cox_data %>%
+  select(-days_to_death)
+```
+
+
+# Fit Cox Model
+
+```{r}
+# Convert categorical variables to dummy variables
+gender_dummies <- model.matrix(~ gender - 1, data = cox_data)
+vital_status_dummies <- model.matrix(~ vital_status - 1, data = cox_data)
+ajcc_stage_dummies <- model.matrix(~ ajcc_pathologic_stage - 1, data = cox_data)
+
+# Combine the dummy variables with the numeric gene expression data
+# Exclude the columns for survival_time and event (columns 4 and 5)
+x <- cbind(cox_data[, -c(4, 5, 1, 2, 3)], gender_dummies, vital_status_dummies, ajcc_stage_dummies)
+
+x <- as.matrix(x)
+
+# Ensure survival data is in the correct format
+y <- Surv(cox_data$survival_time, cox_data$event)
+
+# Fit the Cox model with the glmnet
+cv_fit <- cv.glmnet(x, y, family = "cox")
+
+lambda_min <- cv_fit$lambda.min
+
+cox_summary <- summary(cv_fit)
+
+# Get the linear predictors for each observation (risk scores)
+risk_scores <- predict(cv_fit, s = lambda_min, newx = x, type = "link")
+
+# Calculate concordance index
+c_index <- concordance.index(x = risk_scores,
+                             surv.time = cox_data$survival_time,
+                             surv.event = cox_data$event,
+                             method = "noether")
+
+# Build the formula: include selected genes and any clinical covariates you want
+selected_vars <- colnames(cox_data)[!(colnames(cox_data) %in% c("survival_time", "event"))]
+
+# Build the formula dynamically
+cox_formula <- as.formula(paste("Surv(survival_time, event) ~", paste(selected_vars, collapse = " + ")))
+
+# Fit Cox proportional hazards model using coxph
+cox_model <- coxph(cox_formula, data = cox_data)
+
+```
+
+```{r warning=FALSE}
+ggsurvplot(survfit(Surv(cox_data$survival_time, cox_data$event) ~ 1), 
+           data = cox_data, 
+           risk.table = TRUE,       
+           pval = TRUE,             
+           conf.int = TRUE,         
+           xlab = "Survival Time",  
+           ylab = "Survival Probability", 
+           title = "Survival Curve for Cox Model")
+```
+
+
+## Metrics
+
+| Concordance     | AIC |
+|-----------------|----|
+| `r c_index$c.index`| `r AIC(cox_model)` |
+-------------------
+
+- The Concordance value indicates a relatively strong agreement between the variables.
+
+

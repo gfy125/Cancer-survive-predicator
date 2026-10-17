@@ -1,0 +1,50 @@
+log_expr <- log2(fpkm + 1)
+
+
+ids <- as.character(colData(query2)$barcode)
+batch <- sapply(strsplit(ids, "-"), function(x) {
+  if (length(x) >= 6) return(x[6]) else return(NA)
+})
+
+
+gene_var <- apply(log_expr, 1, var)
+log_expr_filtered <- log_expr[gene_var > 0, ]
+
+
+pca_raw <- prcomp(t(log_expr_filtered), scale. = TRUE)
+pca_df_raw <- data.frame(
+  PC1 = pca_raw$x[, 1],
+  PC2 = pca_raw$x[, 2],
+  batch = batch
+)
+
+library(ggplot2)
+p1 <- ggplot(pca_df_raw, aes(x = PC1, y = PC2, color = batch)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA Before Batch Correction", x = "PC1", y = "PC2")
+
+# 📦 ComBat 
+library(sva)
+modcombat <- model.matrix(~1, data = data.frame(batch = batch))
+combat_expr <- ComBat(dat = as.matrix(log_expr_filtered),
+                      batch = batch,
+                      mod = modcombat,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+
+# ✅ PCA
+pca_corrected <- prcomp(t(combat_expr), scale. = TRUE)
+pca_df_corrected <- data.frame(
+  PC1 = pca_corrected$x[, 1],
+  PC2 = pca_corrected$x[, 2],
+  batch = batch
+)
+
+p2 <- ggplot(pca_df_corrected, aes(x = PC1, y = PC2, color = batch)) +
+  geom_point(size = 2, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "PCA After Batch Correction", x = "PC1", y = "PC2")
+
+p1
+p2

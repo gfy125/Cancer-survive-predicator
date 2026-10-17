@@ -1,0 +1,48 @@
+---
+title: "Dataloading"
+format: html
+editor: visual
+---
+
+```{r}
+citation("curatedTCGAData")
+```
+
+```{r}
+library(TCGAbiolinks)
+library(MultiAssayExperiment)
+library(SummarizedExperiment)
+```
+
+```{r}
+# Query and download gene expression data for TCGA-SKCM
+expression_query <- GDCquery(project = "TCGA-SKCM",
+                             data.category = "Transcriptome Profiling",
+                             data.type = "Gene Expression Quantification",
+                             workflow.type = "STAR - Counts")
+
+GDCdownload(expression_query)
+```
+
+```{r}
+query2 <- GDCprepare(expression_query, directory = 'GDCdata', summarizedExperiment = T)
+save(query2, file = 'SKCM.rda')
+```
+
+```{r}
+query <- GDCquery(
+  project = "TCGA-SKCM",
+  data.category = "Clinical",
+  data.type = "Clinical Supplement",
+  data.format = "BCR XML"
+)
+```
+
+```{r}
+GDCdownload(query)
+
+# Get follow-up info (this pulls multiple timepoints per patient)
+clinical_followup <- GDCprepare_clinic(query, clinical.info = "follow_up")
+write.csv(clinical_followup, "clinical_followup.csv", row.names = FALSE)
+```
+
